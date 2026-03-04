@@ -48,8 +48,12 @@ class SpectralDomainDecomposer:
 
             Domain boundaries at sign changes and local extrema of :math:`v_2`.
 
+            The Laplacian is built entirely in sparse format to avoid
+            allocating two dense L×L matrices.
+
         Args:
-            contact_map: Contact probability matrix, shape (L, L).
+            contact_map: Contact probability matrix, shape (L, L) — may be
+                a dense ``np.ndarray`` or a ``scipy.sparse.csr_matrix``.
             L: Sequence length.
 
         Returns:
@@ -60,23 +64,26 @@ class SpectralDomainDecomposer:
 
         cfg = self.config
 
-        # Compute graph Laplacian
-        D = np.diag(np.sum(contact_map, axis=1))
-        Lap = D - contact_map
+        # Build sparse contact matrix (handle both dense and sparse inputs)
+        if not sparse.issparse(contact_map):
+            cm = sparse.csr_matrix(contact_map)
+        else:
+            cm = contact_map
 
-        # Make sparse for efficiency
-        Lap_sparse = sparse.csr_matrix(Lap)
+        # Compute graph Laplacian purely in sparse space (no dense L×L alloc)
+        degrees = np.array(cm.sum(axis=1)).ravel()
+        D_sparse = sparse.diags(degrees, format="csr")
+        Lap_sparse = D_sparse - cm
 
         try:
-            # Compute Fiedler vector (second smallest eigenvector)
             n_eigs = min(6, L - 1)
             eigenvalues, eigenvectors = eigsh(
-                Lap_sparse, k=n_eigs, which="SM", maxiter=1000
+                Lap_sparse, k=n_eigs, which="SM", maxiter=1000, tol=1e-5
             )
-            fiedler = eigenvectors[:, 1]  # Second eigenvector
+            order = np.argsort(eigenvalues)
+            fiedler = eigenvectors[:, order[1]]
         except Exception as e:
             logger.warning("eigsh_failed", error=str(e))
-            # Fallback: uniform domain decomposition
             return self._uniform_decomposition(L)
 
         # Find domain boundaries at sign changes of Fiedler vector
@@ -84,6 +91,18 @@ class SpectralDomainDecomposer:
         for i in range(1, L):
             if fiedler[i] * fiedler[i - 1] < 0:
                 boundaries.append(i)
+
+        # Fallback for disconnected graphs (no sign changes):
+        # partition by median value of Fiedler vector.
+        if len(boundaries) == 1:
+            threshold = np.median(fiedler)
+            prev_above = bool(fiedler[0] >= threshold)
+            for i in range(1, L):
+                curr_above = bool(fiedler[i] >= threshold)
+                if curr_above != prev_above:
+                    boundaries.append(i)
+                prev_above = curr_above
+
         boundaries.append(L)
 
         # Merge small domains
@@ -217,6 +236,9 @@ class SE3DomainAssembler:
     ) -> np.ndarray:
         """Refine domain assembly via SE(3) gradient descent.
 
+        The inner contact-pair loop is vectorised using ``np.where`` and
+        NumPy broadcasts, handling both dense and sparse contact maps.
+
         Args:
             coords: Initial assembled coordinates.
             domains: Domain boundaries.
@@ -227,48 +249,38 @@ class SE3DomainAssembler:
         """
         cfg = self.config
         n_domains = len(domains)
-        L = coords.shape[0]
-
-        # Per-domain rotation (as axis-angle) and translation
-        rotations = np.zeros((n_domains, 3))  # axis-angle
-        translations = np.zeros((n_domains, 3))
 
         for step in range(cfg.se3_steps):
-            # Compute inter-domain energy gradient
             for d in range(1, n_domains):
                 start, end = domains[d]
-
-                # Gradient of junction energy
-                grad_t = np.zeros(3)
-                n_contacts = 0
+                total_grad = np.zeros(3)
+                total_n = 0
 
                 for d2 in range(n_domains):
                     if d2 == d:
                         continue
                     s2, e2 = domains[d2]
 
-                    # Inter-domain contacts
-                    for i in range(start, end):
-                        for j in range(s2, e2):
-                            if i < contact_map.shape[0] and j < contact_map.shape[1]:
-                                p_contact = contact_map[i, j]
-                                if p_contact > 0.05:
-                                    diff = coords[i] - coords[j]
-                                    dist = np.linalg.norm(diff) + 1e-10
-                                    # Attractive force for contacts
-                                    target_dist = 8.0  # Typical contact distance
-                                    force = p_contact * (dist - target_dist) / dist
-                                    grad_t += force * diff
-                                    n_contacts += 1
+                    if sparse.issparse(contact_map):
+                        block = np.asarray(
+                            contact_map[start:end, s2:e2].todense()
+                        )
+                    else:
+                        block = contact_map[start:end, s2:e2]
 
-                if n_contacts > 0:
-                    grad_t /= n_contacts
+                    rows, cols = np.where(block > 0.05)
+                    if len(rows) == 0:
+                        continue
+                    p_vals = block[rows, cols]
+                    diffs = coords[start + rows] - coords[s2 + cols]
+                    dists = np.linalg.norm(diffs, axis=1) + 1e-10
+                    forces = p_vals * (dists - 8.0) / dists
+                    total_grad += np.sum(
+                        forces[:, np.newaxis] * diffs, axis=0
+                    )
+                    total_n += len(rows)
 
-                # Update translation
-                translations[d] -= cfg.se3_lr * grad_t
-
-                # Apply to coordinates
-                for i in range(start, end):
-                    coords[i] -= cfg.se3_lr * grad_t
+                if total_n > 0:
+                    coords[start:end] -= cfg.se3_lr * (total_grad / total_n)
 
         return coords

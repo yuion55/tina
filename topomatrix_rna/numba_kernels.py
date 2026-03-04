@@ -173,6 +173,71 @@ def rsrnasp1_energy_block(
 
 
 # ---------------------------------------------------------------------------
+# Kernel 4b: rsRNASP1 analytical gradient (O(L) — matches energy kernel)
+# ---------------------------------------------------------------------------
+
+@numba.jit(nopython=True, cache=True)
+def rsrnasp1_gradient(
+    theta_block: np.ndarray, seq_encoded: np.ndarray
+) -> np.ndarray:
+    r"""Compute analytical gradient of rsRNASP1 energy w.r.t. torsion angles.
+
+    Mathematical Basis:
+        For single-body terms :math:`\partial E / \partial \theta_{nk} =
+        \sin(\theta_{nk} - \theta^0_k)`.
+
+        For stacking :math:`\partial E / \partial \theta_{n,0} +=
+        J_{\text{stack}} \sin(\theta_{n,0} - \theta_{n+1,0})`.
+
+        For base-pair coupling :math:`\partial E / \partial \theta_{n,6} +=
+        J_{bp} \sin(\theta_{n,6} - \theta_{m,6})`.
+
+    Args:
+        theta_block: Torsion angles, shape (n_residues, 7).
+        seq_encoded: Encoded sequence (0=A,1=C,2=G,3=U), shape (n_residues,).
+
+    Returns:
+        Gradient array, shape (n_residues, 7).
+    """
+    n_res = theta_block.shape[0]
+    n_tor = theta_block.shape[1]
+    grad = np.zeros((n_res, n_tor))
+
+    theta0 = np.array([5.28, 3.05, 0.91, 2.65, 3.59, 4.71, 3.14])
+
+    # Single-body gradient
+    for n in range(n_res):
+        for k in range(n_tor):
+            grad[n, k] += np.sin(theta_block[n, k] - theta0[k])
+
+    # Stacking gradient (nearest-neighbour)
+    j_stack = 0.5
+    for n in range(n_res - 1):
+        diff = theta_block[n, 0] - theta_block[n + 1, 0]
+        grad[n, 0] += j_stack * np.sin(diff)
+        grad[n + 1, 0] -= j_stack * np.sin(diff)
+
+    # Base-pair coupling gradient
+    for n in range(n_res):
+        for m in range(n + 2, min(n + 30, n_res)):
+            sn = seq_encoded[n]
+            sm = seq_encoded[m]
+            j_bp = 0.0
+            if (sn == 0 and sm == 3) or (sn == 3 and sm == 0):
+                j_bp = 0.8
+            elif (sn == 1 and sm == 2) or (sn == 2 and sm == 1):
+                j_bp = 1.2
+            elif (sn == 2 and sm == 3) or (sn == 3 and sm == 2):
+                j_bp = 0.4
+            if j_bp > 0.0:
+                diff = theta_block[n, 6] - theta_block[m, 6]
+                grad[n, 6] += j_bp * np.sin(diff)
+                grad[m, 6] -= j_bp * np.sin(diff)
+
+    return grad
+
+
+# ---------------------------------------------------------------------------
 # Kernel 5: Tropical min-plus matrix multiplication
 # ---------------------------------------------------------------------------
 
@@ -250,19 +315,56 @@ def tropical_gaussian_elim(A: np.ndarray, b: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 @numba.jit(nopython=True, cache=True)
+def _gf2_rank(G: np.ndarray) -> int:
+    """Compute the rank of a matrix over GF(2) via Gaussian elimination.
+
+    Args:
+        G: Square integer matrix, shape (n, n). Values are reduced mod 2.
+
+    Returns:
+        Rank of G over GF(2).
+    """
+    n = G.shape[0]
+    M = G.copy()
+    rank = 0
+    for col in range(n):
+        pivot = -1
+        for row in range(rank, n):
+            if M[row, col] % 2 == 1:
+                pivot = row
+                break
+        if pivot == -1:
+            continue
+        for c in range(n):
+            tmp = M[rank, c]
+            M[rank, c] = M[pivot, c]
+            M[pivot, c] = tmp
+        for row in range(n):
+            if row != rank and M[row, col] % 2 == 1:
+                for c in range(n):
+                    M[row, c] = (M[row, c] + M[rank, c]) % 2
+        rank += 1
+    return rank
+
+
+@numba.jit(nopython=True, cache=True)
 def compute_genus_gauss_code(
     arc_i: np.ndarray, arc_j: np.ndarray, seq_len: int
 ) -> int:
-    r"""Compute topological genus from base pair arc crossings.
+    r"""Compute topological genus from base pair arc crossings via GF(2) rank.
 
     Mathematical Basis:
         .. math::
-            g = \frac{1}{2}\left(|B| + 1 - \text{rank}(\text{Gauss matrix})\right)
+            g = \left\lfloor
+            \frac{\text{rank}_{\mathbb{F}_2}(G)}{2}
+            \right\rfloor
+
+    where :math:`G` is the Gauss crossing matrix over :math:`\mathbb{F}_2`:
+    :math:`G[a,b] = 1` iff arcs :math:`a` and :math:`b` cross
+    (interleave on the backbone). Each pair of independent crossing arcs
+    contributes one genus, matching the surface embedding genus.
 
     Reference: Penner RC, Waterman MS (1993) Theor Comp Sci 101:109-120
-
-    The Gauss matrix G is a |B| x |B| matrix where G[a,b] = 1 if arcs a and b cross.
-    Two arcs (i1,j1) and (i2,j2) cross iff i1 < i2 < j1 < j2 or i2 < i1 < j2 < j1.
 
     Args:
         arc_i: Left endpoints of base pair arcs, shape (n_arcs,).
@@ -276,24 +378,18 @@ def compute_genus_gauss_code(
     if n_arcs == 0:
         return 0
 
-    # Count crossing pairs: arcs (i1,j1) and (i2,j2) cross iff they interleave
-    n_crossings = 0
+    # Build Gauss crossing matrix over GF(2)
+    G = np.zeros((n_arcs, n_arcs), dtype=np.int64)
     for a in range(n_arcs):
         for b in range(a + 1, n_arcs):
             i1, j1 = arc_i[a], arc_j[a]
             i2, j2 = arc_i[b], arc_j[b]
             if (i1 < i2 < j1 < j2) or (i2 < i1 < j2 < j1):
-                n_crossings += 1
+                G[a, b] = 1
+                G[b, a] = 1
 
-    # Minimum genus required to embed the arc diagram without crossings
-    # Each crossing requires at least one handle (genus increment)
-    # For a planar structure (no crossings), genus = 0
-    # Genus is at least ceil(n_crossings / n_arcs) but at least 1 if any crossings
-    if n_crossings == 0:
-        return 0
-    # Upper bound: each crossing contributes ~1 genus, but shared handles reduce this
-    genus = max(1, (n_crossings + 1) // 2)
-    return genus
+    rank = _gf2_rank(G)
+    return max(0, rank // 2)
 
 
 # ---------------------------------------------------------------------------
@@ -735,7 +831,7 @@ def wasserstein2_persistence(
 
     # Cost of matching point to diagonal: (death - birth)^2 / 4
     total_cost = 0.0
-    used2 = np.zeros(n2, dtype=numba.boolean)
+    used2 = np.zeros(n2, dtype=np.bool_)
 
     for i in range(n1):
         b1 = birth1[i]

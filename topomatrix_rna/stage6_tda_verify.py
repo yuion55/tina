@@ -32,8 +32,9 @@ class TDAVerifier:
     geodesic perturbation if check fails.
     """
 
-    def __init__(self, config: TDAConfig) -> None:
+    def __init__(self, config: TDAConfig, seed: int = 42) -> None:
         self.config = config
+        self._rng = np.random.RandomState(seed)
 
     def verify_and_refine(
         self,
@@ -135,9 +136,8 @@ class TDAVerifier:
         r = self.config.geodesic_kick_scale
         theta_new = theta.copy()
 
-        rng = np.random.RandomState()
         for i in range(L):
-            v = rng.uniform(-np.pi, np.pi, size=n_tor)
+            v = self._rng.uniform(-np.pi, np.pi, size=n_tor)
             v = v / (np.linalg.norm(v) + 1e-10) * r
             theta_new[i] = exp_map_torus(theta[i], v)
 
@@ -152,10 +152,9 @@ class TDAVerifier:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Update persistence diagram incrementally (vineyard-style).
 
-        For small changes (b << L), this is O(b² log L) per step
-        instead of full O(L² log L) recomputation.
-
-        This is an approximate update — full recomputation is used as fallback.
+        For small changes (b ≤ 50), recomputes persistence on the local
+        neighbourhood of changed atoms and scales the result to the full
+        sequence. For larger changes, falls back to full recomputation.
 
         Args:
             coords: Updated coordinates, shape (L, 3).
@@ -166,27 +165,24 @@ class TDAVerifier:
         Returns:
             Updated (birth, death) arrays.
         """
-        # For small changes, approximate by perturbation
-        n_changed = changed_indices.shape[0]
+        n_changed = len(changed_indices)
         L = coords.shape[0]
 
         if n_changed > L // 4:
-            # Too many changes — full recomputation needed
             return self._full_persistence(coords)
 
-        # Approximate: adjust persistence by local distance changes
-        birth = prev_birth.copy()
-        death = prev_death.copy()
+        if n_changed <= 50:
+            from scipy.spatial.distance import cdist
 
-        # Local distance changes affect nearby persistence features
-        for idx in changed_indices:
-            for p in range(len(birth)):
-                # Persistence features near changed atoms get perturbed
-                scale = np.exp(-abs(idx - p) / max(L / 10, 1))
-                noise = np.random.normal(0, 0.01 * scale)
-                death[p] = max(birth[p] + 0.001, death[p] + noise)
+            dists_to_changed = cdist(coords, coords[changed_indices])
+            nearby = np.where(np.any(dists_to_changed < 20, axis=1))[0]
+            if len(nearby) >= 3:
+                b, d = self._full_persistence(coords[nearby])
+                scale = L / len(nearby)
+                return b, d * scale
+            return prev_birth.copy(), prev_death.copy()
 
-        return birth, death
+        return self._full_persistence(coords)
 
     def _full_persistence(
         self, coords: np.ndarray

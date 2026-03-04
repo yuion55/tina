@@ -266,22 +266,33 @@ class TopologicalAtlas:
         return np.array(pairs, dtype=np.float64)
 
     def save(self, path: Optional[str] = None) -> None:
-        """Save atlas to disk as compressed npz file."""
+        """Save atlas to disk as compressed npz file.
+
+        All six fields are persisted: genus, length, sequence, stable_rank,
+        coords_c3, birth_death, and persistence_image.
+        """
         path = path or self.config.atlas_cache_path
         data = {}
         pdb_ids = list(self.entries.keys())
         data["pdb_ids"] = np.array(pdb_ids, dtype=object)
         data["genera"] = np.array([self.entries[k].genus for k in pdb_ids])
         data["lengths"] = np.array([self.entries[k].length for k in pdb_ids])
-
-        sr_matrix = np.stack([self.entries[k].stable_rank for k in pdb_ids])
-        data["stable_ranks"] = sr_matrix
-
+        data["sequences"] = np.array(
+            [self.entries[k].sequence for k in pdb_ids], dtype=object
+        )
+        data["stable_ranks"] = np.stack(
+            [self.entries[k].stable_rank for k in pdb_ids]
+        )
+        for i, k in enumerate(pdb_ids):
+            entry = self.entries[k]
+            data[f"bd_{i}"] = entry.birth_death
+            data[f"coords_{i}"] = entry.coords_c3
+            data[f"pi_{i}"] = entry.persistence_image
         np.savez_compressed(path, **data)
         logger.info("atlas_saved", path=path, n_entries=len(pdb_ids))
 
     def load(self, path: Optional[str] = None) -> None:
-        """Load atlas from disk."""
+        """Load atlas from disk, restoring all six fields per entry."""
         path = path or self.config.atlas_cache_path
         if not os.path.exists(path):
             logger.warning("atlas_cache_not_found", path=path)
@@ -292,22 +303,40 @@ class TopologicalAtlas:
         genera = data["genera"]
         lengths = data["lengths"]
         stable_ranks = data["stable_ranks"]
+        sequences = (
+            data["sequences"] if "sequences" in data else [""] * len(pdb_ids)
+        )
 
         for i, pdb_id in enumerate(pdb_ids):
-            self.entries[str(pdb_id)] = AtlasEntry(
-                pdb_id=str(pdb_id),
-                sequence="",
+            pid = str(pdb_id)
+            self.entries[pid] = AtlasEntry(
+                pdb_id=pid,
+                sequence=str(sequences[i]),
                 length=int(lengths[i]),
                 genus=int(genera[i]),
-                persistence_image=np.zeros(
-                    (self.config.persistence_image_size, self.config.persistence_image_size)
-                ),
+                persistence_image=data[f"pi_{i}"],
                 stable_rank=stable_ranks[i],
-                coords_c3=np.empty((0, 3)),
-                birth_death=np.empty((0, 2)),
+                coords_c3=data[f"coords_{i}"],
+                birth_death=data[f"bd_{i}"],
             )
 
         logger.info("atlas_loaded", path=path, n_entries=len(self.entries))
+
+    def _build_sr_cache(self) -> None:
+        """Pre-build a stable-rank matrix cache for fast vectorised retrieval.
+
+        After calling this, ``self._sr_matrix`` (shape ``(n, stable_rank_dims)``)
+        and ``self._sr_pdb_ids`` (list of pdb_id strings) are available.
+        """
+        keys = list(self.entries.keys())
+        if not keys:
+            self._sr_matrix: np.ndarray = np.empty(
+                (0, self.config.stable_rank_dims)
+            )
+            self._sr_pdb_ids: List[str] = []
+            return
+        self._sr_matrix = np.stack([self.entries[k].stable_rank for k in keys])
+        self._sr_pdb_ids = keys
 
 
 class AtlasEntry:

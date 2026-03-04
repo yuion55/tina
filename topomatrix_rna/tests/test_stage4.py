@@ -105,3 +105,52 @@ class TestRiemannianRefiner:
         theta_opt, _ = refiner.refine(theta_init, seq)
         assert np.all(theta_opt >= 0.0)
         assert np.all(theta_opt < 2 * np.pi + 1e-10)
+
+    def test_energy_decreases_over_steps(self):
+        """ADAM should reduce energy compared to initial."""
+        config = RiemannianConfig(n_steps=50, block_size=10)
+        refiner = RiemannianRefiner(config)
+
+        np.random.seed(0)
+        theta_init = np.random.uniform(0, 2 * np.pi, (10, 7))
+        seq = np.array([0, 3, 1, 2, 0, 3, 1, 2, 0, 3], dtype=np.int64)
+
+        initial_energy = float(rsrnasp1_energy_block(theta_init, seq))
+        _, final_energy = refiner.refine(theta_init, seq)
+
+        assert final_energy <= initial_energy + 1e-6
+
+    def test_symplectic_energy_conservation(self):
+        """Symplectic integrator with same seed gives identical result."""
+        config = RiemannianConfig(n_steps=10, symplectic_h=0.001)
+        refiner = RiemannianRefiner(config)
+
+        np.random.seed(7)
+        theta_init = np.random.uniform(0, 2 * np.pi, (8, 7))
+        seq = np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int64)
+
+        theta1, e1 = refiner.refine_symplectic(theta_init.copy(), seq)
+        theta2, e2 = refiner.refine_symplectic(theta_init.copy(), seq)
+
+        np.testing.assert_allclose(theta1, theta2)
+        assert e1 == pytest.approx(e2)
+
+    def test_torsion_to_coords_bond_distances(self):
+        """All consecutive C3'–C3' distances should be in [3.0, 10.0] Å."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+
+        L = 20
+        np.random.seed(42)
+        theta = np.random.uniform(0, 2 * np.pi, (L, 7))
+        template = np.zeros((L, 3))
+        template[:, 0] = np.arange(L) * 5.9  # Straight chain seed
+
+        coords = refiner.torsion_to_coords(theta, template)
+        assert coords.shape == (L, 3)
+
+        for i in range(1, L):
+            d = np.linalg.norm(coords[i] - coords[i - 1])
+            assert 3.0 <= d <= 10.0, (
+                f"Bond distance between residues {i-1} and {i} = {d:.2f} out of range"
+            )

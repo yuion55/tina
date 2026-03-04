@@ -23,6 +23,7 @@ from .numba_kernels import (
     exp_map_torus,
     parallel_transport_torus,
     rsrnasp1_energy_block,
+    rsrnasp1_gradient,
     stoermer_verlet_step,
     torus_geodesic_distance,
 )
@@ -74,6 +75,8 @@ class RiemannianRefiner:
         m = np.zeros_like(theta)  # First moment
         v = np.zeros((L,))  # Second moment (scalar per residue)
 
+        # Keep a reference to the caller-supplied function (None → analytical grad)
+        _custom_energy_fn = energy_fn
         if energy_fn is None:
             energy_fn = lambda t: float(rsrnasp1_energy_block(t, seq_encoded))
 
@@ -86,8 +89,9 @@ class RiemannianRefiner:
         )
 
         for step in range(cfg.n_steps):
-            # Compute gradient via finite differences
-            grad = self._compute_gradient(theta, seq_encoded, energy_fn)
+            # Compute gradient: analytical O(L) when no custom energy_fn,
+            # finite differences O(L·7) otherwise.
+            grad = self._compute_gradient(theta, seq_encoded, _custom_energy_fn)
 
             # Riemannian ADAM update (block-coordinate for Hogwild)
             block_start = (step * cfg.block_size) % L
@@ -144,6 +148,9 @@ class RiemannianRefiner:
             :math:`\theta^{n+1} = (\theta^n + h \cdot p^{n+1/2}) \bmod 2\pi`
             :math:`p^{n+1} = p^{n+1/2} - \frac{h}{2}\nabla_\theta E(\theta^{n+1})`
 
+        The gradient is recomputed at the new position :math:`\theta^{n+1}` for
+        the second half-step, ensuring true symplectic integration.
+
         Args:
             theta_init: Initial torsion angles, shape (L, 7).
             seq_encoded: Encoded sequence, shape (L,).
@@ -154,8 +161,10 @@ class RiemannianRefiner:
         """
         cfg = self.config
         theta = theta_init.copy()
-        p = np.zeros_like(theta)  # Momenta
+        p = np.zeros_like(theta)
 
+        # Keep reference to caller-supplied function (None → analytical grad)
+        _custom_energy_fn = energy_fn
         if energy_fn is None:
             energy_fn = lambda t: float(rsrnasp1_energy_block(t, seq_encoded))
 
@@ -163,13 +172,12 @@ class RiemannianRefiner:
         best_energy = energy_fn(theta)
 
         for step in range(cfg.n_steps):
-            grad = self._compute_gradient(theta, seq_encoded, energy_fn)
+            grad_old = self._compute_gradient(theta, seq_encoded, _custom_energy_fn)
+            p -= 0.5 * cfg.symplectic_h * grad_old
+            theta = (theta + cfg.symplectic_h * p) % (2.0 * np.pi)
+            grad_new = self._compute_gradient(theta, seq_encoded, _custom_energy_fn)
+            p -= 0.5 * cfg.symplectic_h * grad_new
 
-            # Störmer-Verlet step
-            grad_new = grad.copy()  # Will be recomputed
-            stoermer_verlet_step(theta, p, cfg.symplectic_h, grad, grad_new)
-
-            # Recompute gradient at new position for next step
             current_energy = energy_fn(theta)
             if current_energy < best_energy:
                 best_energy = current_energy
@@ -181,23 +189,32 @@ class RiemannianRefiner:
         self,
         theta: np.ndarray,
         seq_encoded: np.ndarray,
-        energy_fn: Callable,
+        energy_fn: Optional[Callable] = None,
         delta: float = 1e-4,
     ) -> np.ndarray:
-        """Compute gradient via central finite differences.
+        """Compute gradient of the rsRNASP1 energy w.r.t. torsion angles.
+
+        Uses the analytical ``rsrnasp1_gradient`` kernel (O(L)) when no custom
+        energy function is provided, falling back to central finite differences
+        (O(L·7)) only for custom energy functions.
 
         Args:
             theta: Current torsion angles, shape (L, 7).
             seq_encoded: Encoded sequence, shape (L,).
-            energy_fn: Energy function.
-            delta: Finite difference step size.
+            energy_fn: Optional custom energy function. If ``None``, the
+                analytical gradient is used.
+            delta: Finite difference step size (used only when energy_fn is
+                not None).
 
         Returns:
             Gradient array, shape (L, 7).
         """
+        if energy_fn is None:
+            return rsrnasp1_gradient(theta, seq_encoded)
+
+        # Finite differences only for custom energy functions
         L, n_tor = theta.shape
         grad = np.zeros_like(theta)
-
         for i in range(L):
             for k in range(n_tor):
                 theta_plus = theta.copy()
@@ -205,41 +222,59 @@ class RiemannianRefiner:
                 theta_plus[i, k] += delta
                 theta_minus[i, k] -= delta
                 grad[i, k] = (energy_fn(theta_plus) - energy_fn(theta_minus)) / (2 * delta)
-
         return grad
 
     def torsion_to_coords(
         self, theta: np.ndarray, template_coords: np.ndarray
     ) -> np.ndarray:
-        """Convert torsion angles to C3' Cartesian coordinates.
+        """Convert torsion angles to C3' Cartesian coordinates via NeRF.
 
-        Uses template coordinates as reference and applies torsion-based
-        deformations.
+        Uses the Natural Extension Reference Frame (NeRF) algorithm to
+        build a chain of C3' atoms that respects the given backbone torsion
+        angles while maintaining fixed bond lengths and bond angles.
 
         Args:
             theta: Torsion angles, shape (L, 7).
-            template_coords: Template C3' coordinates, shape (L, 3).
+            template_coords: Template C3' coordinates used to seed the first
+                three residues, shape (M, 3).
 
         Returns:
             Predicted C3' coordinates, shape (L, 3).
         """
         L = theta.shape[0]
-        coords = template_coords[:L].copy()
+        coords = np.zeros((L, 3))
 
-        # Apply torsion-based deformation
-        # Bond length ~5.9Å between consecutive C3' atoms
-        bond_length = 5.9
-        for i in range(1, L):
-            # Use backbone torsions (alpha, beta, gamma) for direction
-            alpha = theta[i, 0]
-            beta = theta[i, 1]
+        # Seed with template (up to 3 residues)
+        if template_coords.shape[0] >= 3:
+            coords[:3] = template_coords[:3].copy()
+        else:
+            coords[0] = np.array([0.0, 0.0, 0.0])
+            coords[1] = np.array([5.9, 0.0, 0.0])
+            coords[2] = np.array([11.8, 0.0, 0.0])
 
-            dx = bond_length * np.cos(alpha) * np.sin(beta)
-            dy = bond_length * np.sin(alpha) * np.sin(beta)
-            dz = bond_length * np.cos(beta)
+        BOND_LENGTH = 5.9      # Å, C3'–C3' virtual bond
+        BOND_ANGLE = 1.745     # rad, ~100°
 
-            # Blend template and torsion-derived position
-            torsion_pos = coords[i - 1] + np.array([dx, dy, dz])
-            coords[i] = 0.7 * template_coords[i] + 0.3 * torsion_pos if i < template_coords.shape[0] else torsion_pos
+        COMPLEMENT_ANGLE = np.pi - BOND_ANGLE  # ~0.204 rad (complement of ~100°)
+
+        for i in range(3, L):
+            a, b, c = coords[i - 3], coords[i - 2], coords[i - 1]
+            torsion = theta[i, 0]  # Backbone torsion (alpha)
+
+            bc = c - b
+            bc_norm = np.linalg.norm(bc)
+            bc = bc / (bc_norm + 1e-10)
+
+            n_vec = np.cross(b - a, bc)
+            n_norm = np.linalg.norm(n_vec)
+            n_vec = n_vec / n_norm if n_norm > 1e-10 else np.array([0.0, 0.0, 1.0])
+
+            d = np.array([
+                -BOND_LENGTH * np.cos(COMPLEMENT_ANGLE),
+                 BOND_LENGTH * np.cos(torsion) * np.sin(COMPLEMENT_ANGLE),
+                 BOND_LENGTH * np.sin(torsion) * np.sin(COMPLEMENT_ANGLE),
+            ])
+            M = np.column_stack([bc, np.cross(n_vec, bc), n_vec])
+            coords[i] = c + M @ d
 
         return coords

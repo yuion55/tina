@@ -20,7 +20,7 @@ from scipy import sparse
 
 from .config import ContactMapConfig
 from .data_utils import encode_sequence
-from .numba_kernels import rg_block_contact_map
+from .numba_kernels import compute_genus_gauss_code, rg_block_contact_map
 
 logger = structlog.get_logger(__name__)
 
@@ -110,23 +110,16 @@ class ContactMapPredictor:
             bs = end - start
             P_full[start:end, start:end] = local_maps[bi][:bs, :bs]
 
-        # Fill inter-block contacts
+        # Fill inter-block contacts (vectorised)
         for bi in range(n_blocks):
             for bj in range(bi + 1, n_blocks):
                 si, ei = block_starts[bi], block_ends[bi]
                 sj, ej = block_starts[bj], block_ends[bj]
-                bsi = ei - si
-                bsj = ej - sj
-
-                # Scale by inter-block probability
-                p_inter = P_inter[bi, bj]
-                for i in range(bsi):
-                    for j in range(bsj):
-                        # Local probability contribution
-                        p_local_i = local_maps[bi][i, i] if i < local_maps[bi].shape[0] else 0.5
-                        p_local_j = local_maps[bj][j, j] if j < local_maps[bj].shape[0] else 0.5
-                        P_full[si + i, sj + j] = p_inter * p_local_i * p_local_j
-                        P_full[sj + j, si + i] = P_full[si + i, sj + j]
+                local_i_diag = np.diag(local_maps[bi])[: (ei - si)]
+                local_j_diag = np.diag(local_maps[bj])[: (ej - sj)]
+                block = P_inter[bi, bj] * np.outer(local_i_diag, local_j_diag)
+                P_full[si:ei, sj:ej] = block
+                P_full[sj:ej, si:ei] = block.T
 
         # Ensure symmetric and bounded
         P_full = (P_full + P_full.T) / 2.0
@@ -135,7 +128,7 @@ class ContactMapPredictor:
         # Sparsify for large sequences
         if return_sparse and L > 1000:
             P_full[P_full < 0.01] = 0.0
-            return sparse.csr_matrix(P_full).toarray()
+            return sparse.csr_matrix(P_full)
 
         return P_full
 
@@ -182,31 +175,38 @@ class ContactMapPredictor:
 
         return P_inter
 
-    def extract_genus(self, contact_map: np.ndarray) -> int:
-        r"""Extract topological genus from contact map.
+    def extract_genus(self, contact_map: np.ndarray, sequence: str = "") -> int:
+        r"""Extract topological genus from contact map via Gauss code rank.
 
         Mathematical Basis:
-            Uses :math:`1/N^{2g}` expansion coefficient:
-            :math:`\hat{g} = \arg\max_g \sum_{i<j} P_{ij}^{(g)}`
+            :math:`g = \max(0, \lfloor(|B| + 1 -
+            \text{rank}_{\mathbb{F}_2}(G)) / 2\rfloor)`
+
+            where :math:`G` is the arc crossing matrix over :math:`\mathbb{F}_2`.
 
         Args:
             contact_map: Contact probability matrix, shape (L, L).
+            sequence: RNA sequence string (unused, kept for API compatibility).
 
         Returns:
             Estimated genus (int >= 0).
         """
-        L = contact_map.shape[0]
+        if sparse.issparse(contact_map):
+            cm = contact_map.toarray()
+        else:
+            cm = contact_map
+        L = cm.shape[0]
         if L < 5:
             return 0
 
-        # Eigenvalue analysis of contact map
-        eigenvalues = np.linalg.eigvalsh(contact_map)
-        eigenvalues = np.sort(eigenvalues)[::-1]
-
-        # Genus estimated from spectral gap structure
-        # Number of significant eigenvalues ~ 2g + 1
-        threshold = eigenvalues[0] * 0.1 if eigenvalues[0] > 0 else 0.01
-        n_significant = int(np.sum(eigenvalues > threshold))
-        genus = max(0, (n_significant - 1) // 2)
-
-        return genus
+        threshold = 0.3
+        bp_i, bp_j = np.where(
+            (cm > threshold)
+            & (np.arange(L)[:, None] < np.arange(L)[None, :])
+        )
+        valid = (bp_j - bp_i) >= 4
+        arc_i = bp_i[valid].astype(np.int64)
+        arc_j = bp_j[valid].astype(np.int64)
+        if len(arc_i) == 0:
+            return 0
+        return int(compute_genus_gauss_code(arc_i, arc_j, L))
