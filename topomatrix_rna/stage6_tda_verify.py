@@ -43,6 +43,8 @@ class TDAVerifier:
         target_birth_death: np.ndarray,
         compute_persistence_fn: Callable,
         refine_fn: Callable,
+        bp_list: Optional[list[tuple[int, int]]] = None,
+        expected_genus: Optional[int] = None,
     ) -> Tuple[np.ndarray, bool, int]:
         r"""Verify topological consistency and retry if needed.
 
@@ -83,6 +85,15 @@ class TDAVerifier:
             # Check consistency
             target_birth = target_birth_death[:, 0] if target_birth_death.shape[0] > 0 else np.empty(0)
             target_death = target_birth_death[:, 1] if target_birth_death.shape[0] > 0 else np.empty(0)
+
+            # Genus consistency check
+            if bp_list is not None and expected_genus is not None:
+                pred_genus = count_pseudoknot_genus(bp_list)
+                if pred_genus != expected_genus:
+                    logger.warning(
+                        "genus_mismatch",
+                        predicted=pred_genus, expected=expected_genus,
+                    )
 
             w2 = float(wasserstein2_persistence(
                 pred_birth, pred_death, target_birth, target_death
