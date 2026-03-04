@@ -229,3 +229,38 @@ class TDAVerifier:
             return np.array([0.0]), np.array([1.0])
 
         return np.array(births), np.array(deaths)
+
+
+def count_pseudoknot_genus(bp_list: list[tuple[int, int]]) -> int:
+    """Count the topological genus contribution from pseudoknots.
+
+    Each H-type pseudoknot (crossing base pair stem) contributes +1 to genus.
+    Kissing hairpins contribute +1.
+    Standard nested secondary structure has genus 0.
+
+    Uses a simple arc-crossing count: each independent set of mutually
+    crossing arcs corresponds to one genus increment.
+
+    Args:
+        bp_list: List of (i, j) base pairs with i < j.
+
+    Returns:
+        Integer genus >= 0.
+    """
+    sorted_bps = sorted(bp_list)
+    n = len(sorted_bps)
+    genus = 0
+    counted: set[int] = set()
+
+    for a, (i, j) in enumerate(sorted_bps):
+        if a in counted:
+            continue
+        for b, (k, l) in enumerate(sorted_bps[a + 1:], start=a + 1):
+            if b in counted:
+                continue
+            if i < k < j < l:   # crossing pair
+                genus += 1
+                counted.add(a)
+                counted.add(b)
+                break   # count once per crossing set
+    return genus

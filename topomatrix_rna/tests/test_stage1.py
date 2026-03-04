@@ -72,3 +72,122 @@ class TestContactMapPredictor:
         g = predictor.extract_genus(P)
         assert isinstance(g, int)
         assert g >= 0
+
+
+class TestLWWeights:
+    """Tests for Leontis-Westhof base pair weight lookup."""
+
+    def test_gc_cww(self):
+        """G-C cWW should return 1.0."""
+        from topomatrix_rna.stage1_contact_map import get_lw_weight
+        assert get_lw_weight('G', 'C', 'cWW') == 1.0
+
+    def test_au_cww(self):
+        """A-U cWW should return 0.9."""
+        from topomatrix_rna.stage1_contact_map import get_lw_weight
+        assert get_lw_weight('A', 'U', 'cWW') == 0.9
+
+    def test_gu_wobble(self):
+        """G-U cWW (wobble) should return 0.7."""
+        from topomatrix_rna.stage1_contact_map import get_lw_weight
+        assert get_lw_weight('G', 'U', 'cWW') == 0.7
+
+    def test_symmetric_fallback(self):
+        """Lookup should fall back to reversed pair."""
+        from topomatrix_rna.stage1_contact_map import get_lw_weight
+        assert get_lw_weight('C', 'G', 'cWW') == 1.0
+
+    def test_unknown_pair_default(self):
+        """Unknown pair should return default 0.4."""
+        from topomatrix_rna.stage1_contact_map import get_lw_weight
+        assert get_lw_weight('U', 'U', 'cWW') == 0.4
+
+    def test_non_canonical_family(self):
+        """Known non-canonical family should return correct weight."""
+        from topomatrix_rna.stage1_contact_map import get_lw_weight
+        assert get_lw_weight('G', 'A', 'tHS') == 0.5
+
+
+class TestDetectTetraloops:
+    """Tests for GNRA/UNCG tetraloop detection."""
+
+    def test_gnra(self):
+        """Should detect GNRA tetraloops."""
+        from topomatrix_rna.stage1_contact_map import detect_tetraloops
+        hits = detect_tetraloops("GAAAGAAA")
+        assert 0 in hits
+        assert hits[0] == 'GNRA'
+
+    def test_uucg(self):
+        """Should detect UUCG tetraloop."""
+        from topomatrix_rna.stage1_contact_map import detect_tetraloops
+        hits = detect_tetraloops("AAUUCGAA")
+        assert 2 in hits
+        assert hits[2] == 'UUCG'
+
+    def test_uncg(self):
+        """Should detect UNCG tetraloop."""
+        from topomatrix_rna.stage1_contact_map import detect_tetraloops
+        hits = detect_tetraloops("AAUACGAA")
+        assert 2 in hits
+        assert hits[2] == 'UNCG'
+
+    def test_no_tetraloops(self):
+        """Should return empty dict when no tetraloops present."""
+        from topomatrix_rna.stage1_contact_map import detect_tetraloops
+        hits = detect_tetraloops("CCCCCCCC")
+        assert len(hits) == 0
+
+    def test_uucg_preferred_over_uncg(self):
+        """UUCG should be preferred over generic UNCG at same position."""
+        from topomatrix_rna.stage1_contact_map import detect_tetraloops
+        hits = detect_tetraloops("UUCG")
+        assert 0 in hits
+        assert hits[0] == 'UUCG'
+
+
+class TestFindCrossingPairs:
+    """Tests for pseudoknot crossing pair detection."""
+
+    def test_no_crossing(self):
+        """Nested pairs should have no crossings."""
+        from topomatrix_rna.stage1_contact_map import find_crossing_pairs
+        bp_list = [(0, 10), (1, 9), (2, 8)]
+        assert len(find_crossing_pairs(bp_list)) == 0
+
+    def test_simple_crossing(self):
+        """Simple pseudoknot should be detected."""
+        from topomatrix_rna.stage1_contact_map import find_crossing_pairs
+        bp_list = [(0, 5), (3, 8)]  # 0 < 3 < 5 < 8
+        crossing = find_crossing_pairs(bp_list)
+        assert (3, 8) in crossing
+
+    def test_empty_list(self):
+        """Empty input should return empty set."""
+        from topomatrix_rna.stage1_contact_map import find_crossing_pairs
+        assert len(find_crossing_pairs([])) == 0
+
+
+class TestDetectCoaxialJunctions:
+    """Tests for coaxial stack junction detection."""
+
+    def test_adjacent_helices(self):
+        """Adjacent helices (gap=0) should be detected as coaxial."""
+        from topomatrix_rna.stage1_contact_map import detect_coaxial_junctions
+        helices = [(0, 10), (10, 20)]
+        pairs = detect_coaxial_junctions(helices)
+        assert (0, 1) in pairs
+
+    def test_gap_one(self):
+        """Helices with gap of 1 should be detected."""
+        from topomatrix_rna.stage1_contact_map import detect_coaxial_junctions
+        helices = [(0, 10), (11, 20)]
+        pairs = detect_coaxial_junctions(helices)
+        assert (0, 1) in pairs
+
+    def test_no_coaxial(self):
+        """Distant helices should not be coaxial."""
+        from topomatrix_rna.stage1_contact_map import detect_coaxial_junctions
+        helices = [(0, 10), (15, 25)]
+        pairs = detect_coaxial_junctions(helices)
+        assert len(pairs) == 0

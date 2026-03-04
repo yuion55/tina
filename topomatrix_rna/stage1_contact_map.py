@@ -12,17 +12,149 @@ References:
 
 from __future__ import annotations
 
+import re
 from typing import Optional, Tuple
 
 import numpy as np
 import structlog
 from scipy import sparse
 
-from .config import ContactMapConfig
+from .config import ContactMapConfig, RNABiologyConstants
 from .data_utils import encode_sequence
 from .numba_kernels import compute_genus_gauss_code, rg_block_contact_map
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Leontis-Westhof 12-family weights
+# Key: (base_i, base_j, family_abbr) where family_abbr is one of:
+# cWW, tWW, cWH, tWH, cWS, tWS, cHH, tHH, cHS, tHS, cSS, tSS
+# Source: Leontis NB, Westhof E (2001) RNA 7:499-512
+# ---------------------------------------------------------------------------
+LW_BP_WEIGHTS: dict[tuple[str, str, str], float] = {
+    ('G', 'C', 'cWW'): 1.0,
+    ('C', 'G', 'cWW'): 1.0,
+    ('A', 'U', 'cWW'): 0.9,
+    ('U', 'A', 'cWW'): 0.9,
+    ('G', 'U', 'cWW'): 0.7,   # wobble
+    ('U', 'G', 'cWW'): 0.7,   # wobble
+    ('G', 'A', 'tHS'): 0.5,   # kink-turn G•A
+    ('A', 'G', 'tHS'): 0.5,
+    ('G', 'A', 'tWS'): 0.45,
+    ('A', 'G', 'tWS'): 0.45,
+    ('G', 'G', 'cSS'): 0.4,
+    ('A', 'A', 'cWS'): 0.4,
+    ('A', 'C', 'cWS'): 0.35,
+    ('C', 'A', 'cWS'): 0.35,
+}
+
+
+def get_lw_weight(base_i: str, base_j: str, family: str = 'cWW') -> float:
+    """Return Leontis-Westhof weight for a base pair.
+
+    Falls back symmetrically, then to default non-canonical weight.
+
+    Args:
+        base_i: Single-character base identity (A, C, G, U).
+        base_j: Single-character base identity (A, C, G, U).
+        family: Leontis-Westhof family abbreviation (default 'cWW').
+
+    Returns:
+        Weight in [0, 1].
+    """
+    w = LW_BP_WEIGHTS.get((base_i, base_j, family))
+    if w is not None:
+        return w
+    w = LW_BP_WEIGHTS.get((base_j, base_i, family))
+    if w is not None:
+        return w
+    return 0.4  # default non-canonical
+
+
+# ---------------------------------------------------------------------------
+# GNRA / UNCG Tetraloop Detection
+# Source: Woese CR et al. (1990) PNAS 87:8467-8471
+# ---------------------------------------------------------------------------
+_GNRA_RE = re.compile(r'G[ACGU][AG]A')
+_UNCG_RE = re.compile(r'U[ACGU]CG')
+_UUCG_RE = re.compile(r'UUCG')
+
+
+def detect_tetraloops(seq: str) -> dict[int, str]:
+    """Return {start_position: loop_type} for all GNRA/UNCG tetraloops.
+
+    Types: 'GNRA', 'UNCG', 'UUCG' (UUCG is thermodynamically most stable).
+    Positions within a hairpin loop of length 4 only (enforced by caller).
+
+    Args:
+        seq: RNA sequence string (ACGU).
+
+    Returns:
+        Mapping from start position to tetraloop type name.
+    """
+    hits: dict[int, str] = {}
+    for m in _UUCG_RE.finditer(seq):
+        hits[m.start()] = 'UUCG'
+    for m in _UNCG_RE.finditer(seq):
+        if m.start() not in hits:
+            hits[m.start()] = 'UNCG'
+    for m in _GNRA_RE.finditer(seq):
+        if m.start() not in hits:
+            hits[m.start()] = 'GNRA'
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Pseudoknot Cross-Pair Detection
+# ---------------------------------------------------------------------------
+def find_crossing_pairs(bp_list: list[tuple[int, int]]) -> set[tuple[int, int]]:
+    """Return base pairs that cross another pair (i.e. form pseudoknots).
+
+    A pair (k, l) crosses (i, j) when i < k < j < l.
+
+    Args:
+        bp_list: List of (i, j) base pairs with i < j.
+
+    Returns:
+        Set of crossing (k, l) pairs.
+    """
+    crossing: set[tuple[int, int]] = set()
+    sorted_bps = sorted(bp_list)
+    for idx, (i, j) in enumerate(sorted_bps):
+        for (k, l) in sorted_bps[idx + 1:]:
+            if k >= j:
+                break
+            if i < k < j < l:
+                crossing.add((k, l))
+    return crossing
+
+
+# ---------------------------------------------------------------------------
+# Coaxial Stack Junction Detector
+# ---------------------------------------------------------------------------
+def detect_coaxial_junctions(
+    helices: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return pairs of helix indices that are directly coaxially stackable.
+
+    Two helices are coaxial if one ends exactly where the other begins
+    (gap of 0 or 1 unpaired nucleotide at the junction).
+
+    Args:
+        helices: List of (start, end) helix spans.
+
+    Returns:
+        List of (helix_index_i, helix_index_j) pairs.
+    """
+    coaxial_pairs = []
+    for i, (s1, e1) in enumerate(helices):
+        for j, (s2, e2) in enumerate(helices):
+            if i >= j:
+                continue
+            gap = min(abs(e1 - s2), abs(e2 - s1))
+            if gap <= 1:
+                coaxial_pairs.append((i, j))
+    return coaxial_pairs
 
 
 class ContactMapPredictor:

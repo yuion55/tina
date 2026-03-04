@@ -154,3 +154,100 @@ class TestRiemannianRefiner:
             assert 3.0 <= d <= 10.0, (
                 f"Bond distance between residues {i-1} and {i} = {d:.2f} out of range"
             )
+
+
+class TestSuiteConformerPenalty:
+    """Tests for suite conformer penalty function."""
+
+    def test_a_form_zero_penalty(self):
+        """A-form angles should have zero or near-zero penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        a_form = {
+            'delta_prev': 83, 'epsilon': 212, 'zeta': 289,
+            'alpha': -68, 'beta': 178, 'gamma': 55, 'delta': 83,
+        }
+        penalty = refiner.suite_conformer_penalty(a_form)
+        assert penalty == pytest.approx(0.0, abs=1e-6)
+
+    def test_outlier_positive_penalty(self):
+        """Outlier angles should have positive penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        outlier = {
+            'delta_prev': 0, 'epsilon': 0, 'zeta': 0,
+            'alpha': 0, 'beta': 0, 'gamma': 0, 'delta': 0,
+        }
+        penalty = refiner.suite_conformer_penalty(outlier)
+        assert penalty > 0.0
+
+    def test_penalty_non_negative(self):
+        """Penalty should always be non-negative."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        random_angles = {k: np.random.uniform(-180, 360) for k in
+                         ['delta_prev', 'epsilon', 'zeta', 'alpha', 'beta', 'gamma', 'delta']}
+        penalty = refiner.suite_conformer_penalty(random_angles)
+        assert penalty >= 0.0
+
+
+class TestSugarPuckerPenalty:
+    """Tests for sugar pucker penalty function."""
+
+    def test_c3endo_zero_penalty(self):
+        """C3'-endo delta should have zero penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        assert refiner.sugar_pucker_penalty(83.0) == 0.0
+
+    def test_c2endo_helix_small_penalty(self):
+        """C2'-endo in helix position should have small penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        assert refiner.sugar_pucker_penalty(145.0, 'helix') == 0.5
+
+    def test_c2endo_non_canonical_zero(self):
+        """C2'-endo in non-canonical position should have zero penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        assert refiner.sugar_pucker_penalty(145.0, 'non_canonical') == 0.0
+
+    def test_outside_both_windows(self):
+        """Delta outside both windows should have large penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        penalty = refiner.sugar_pucker_penalty(200.0)
+        assert penalty > 0.0
+
+
+class TestChiSynPenalty:
+    """Tests for chi syn conformation penalty."""
+
+    def test_anti_no_penalty(self):
+        """Anti chi (|chi| > 90) should have zero penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        assert refiner.chi_syn_penalty(-159.0) == 0.0
+        assert refiner.chi_syn_penalty(120.0) == 0.0
+
+    def test_syn_positive_penalty(self):
+        """Syn chi (|chi| < 90) should have positive penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        assert refiner.chi_syn_penalty(0.0) > 0.0
+        assert refiner.chi_syn_penalty(45.0) > 0.0
+
+    def test_boundary_zero(self):
+        """Chi at ±90 boundary should have zero penalty."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        assert refiner.chi_syn_penalty(90.1) == 0.0
+        assert refiner.chi_syn_penalty(-90.1) == 0.0
+
+    def test_penalty_increases_toward_zero(self):
+        """Penalty should be largest at chi=0."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        p_zero = refiner.chi_syn_penalty(0.0)
+        p_45 = refiner.chi_syn_penalty(45.0)
+        assert p_zero > p_45

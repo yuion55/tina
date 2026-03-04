@@ -17,7 +17,7 @@ import numpy as np
 import structlog
 from scipy import sparse
 
-from .config import TropicalConfig
+from .config import TropicalConfig, RNABiologyConstants
 from .data_utils import encode_sequence
 from .numba_kernels import tropical_gaussian_elim, tropical_min_plus
 
@@ -164,12 +164,12 @@ class TropicalBasinCensus:
         # Encoding: A=0, C=1, G=2, U=3
         bp_weights = np.full((L, L), np.inf)
         pair_rules = [
-            (0, 3, 1.0),   # A-U
-            (3, 0, 1.0),   # U-A
-            (1, 2, 1.5),   # C-G (stronger)
-            (2, 1, 1.5),   # G-C
-            (2, 3, 0.5),   # G-U wobble
-            (3, 2, 0.5),   # U-G wobble
+            (0, 3, 0.9),   # A-U
+            (3, 0, 0.9),   # U-A
+            (1, 2, 1.0),   # C-G
+            (2, 1, 1.0),   # G-C
+            (2, 3, 0.7),   # G-U wobble
+            (3, 2, 0.7),   # U-G wobble
         ]
         for (si, sj, wt) in pair_rules:
             mask = (encoded[:, None] == si) & (encoded[None, :] == sj)
@@ -341,3 +341,85 @@ class TropicalBasinCensus:
             coords_list.append(coords)
 
         return coords_list
+
+
+def compute_electrostatic_penalty(
+    coords_c4prime: np.ndarray,
+    config: RNABiologyConstants,
+    mg_conc_mm: float = 2.0,
+) -> np.ndarray:
+    """Debye-Hückel electrostatic penalty matrix.
+
+    Returns (L, L) penalty array. Penalty is positive (unfavourable) for
+    close phosphate pairs that are not base-paired — model of backbone
+    repulsion screened by Mg2+.
+
+    Debye length λ ≈ 7.0 Å at 2 mM Mg2+.
+    Penalty = exp(-r_ij / λ) for all pairs where r < 15 Å and |i-j| > 3.
+
+    Source: Draper DE (2004) RNA 10:335-343.
+
+    Args:
+        coords_c4prime: C4' atom coordinates as backbone proxy, shape (L, 3).
+        config: RNABiologyConstants instance.
+        mg_conc_mm: Mg2+ concentration in mM (default 2.0).
+
+    Returns:
+        Penalty matrix, shape (L, L).
+    """
+    DEBYE_LAMBDA = config.debye_length_mg_2mm  # 7.0 Å
+    CUTOFF = 15.0   # Å, beyond this the penalty is negligible
+    SCALE = 0.05    # kcal/mol units, calibrated against Turner params
+
+    L = coords_c4prime.shape[0]
+    penalty = np.zeros((L, L), dtype=np.float32)
+
+    diff = coords_c4prime[:, None, :] - coords_c4prime[None, :, :]  # (L,L,3)
+    dist = np.linalg.norm(diff, axis=-1)  # (L,L)
+
+    close_mask = (dist < CUTOFF) & (dist > 0.1)
+    seq_mask = np.abs(np.arange(L)[:, None] - np.arange(L)[None, :]) > 3
+    active = close_mask & seq_mask
+
+    penalty[active] = SCALE * np.exp(-dist[active] / DEBYE_LAMBDA)
+    return penalty
+
+
+def compute_pseudotorsions(
+    c4prime_coords: np.ndarray,
+    p_coords: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute η and θ pseudotorsion angles for each nucleotide.
+
+    η(i) = torsion(C4'(i-1), P(i),  C4'(i), P(i+1))
+    θ(i) = torsion(P(i),     C4'(i), P(i+1), C4'(i+1))
+
+    Source: Wadley LM, Pyle AM (2004) NAR 32:6650-6659.
+
+    Args:
+        c4prime_coords: C4' atom coordinates, shape (L, 3).
+        p_coords: Phosphorus atom coordinates, shape (L, 3).
+
+    Returns:
+        Tuple of (eta, theta) each shape (L,) in degrees. NaN at termini.
+    """
+    def torsion(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> float:
+        b1 = b - a
+        b2 = c - b
+        b3 = d - c
+        n1 = np.cross(b1, b2)
+        n2 = np.cross(b2, b3)
+        m1 = np.cross(n1, b2 / (np.linalg.norm(b2) + 1e-12))
+        x = np.dot(n1, n2)
+        y = np.dot(m1, n2)
+        return np.degrees(np.arctan2(y, x))
+
+    L = c4prime_coords.shape[0]
+    eta = np.full(L, np.nan)
+    theta = np.full(L, np.nan)
+    for i in range(1, L - 1):
+        eta[i] = torsion(c4prime_coords[i - 1], p_coords[i],
+                         c4prime_coords[i], p_coords[i + 1])
+        theta[i] = torsion(p_coords[i], c4prime_coords[i],
+                           p_coords[i + 1], c4prime_coords[i + 1])
+    return eta, theta

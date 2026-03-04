@@ -18,7 +18,7 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 import structlog
 
-from .config import RiemannianConfig
+from .config import RiemannianConfig, RNABiologyConstants
 from .numba_kernels import (
     exp_map_torus,
     parallel_transport_torus,
@@ -29,6 +29,27 @@ from .numba_kernels import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# RNA backbone suite conformer cluster means (degrees)
+# Format: suite_name -> {'delta_prev', 'epsilon', 'zeta', 'alpha', 'beta', 'gamma', 'delta'}
+# Source: Richardson JS et al. (2008) RNA 14:465-481
+# ---------------------------------------------------------------------------
+SUITE_CLUSTER_MEANS: dict[str, dict[str, float]] = {
+    '1a': {'delta_prev': 83, 'epsilon': 212, 'zeta': 289, 'alpha': -68, 'beta': 178, 'gamma': 55,  'delta': 83},   # A-form
+    '1L': {'delta_prev': 83, 'epsilon': 245, 'zeta': 179, 'alpha': -68, 'beta': 163, 'gamma': 50,  'delta': 84},
+    '1m': {'delta_prev': 86, 'epsilon': 218, 'zeta': 291, 'alpha': -70, 'beta': 168, 'gamma': 51,  'delta': 145},
+    '5z': {'delta_prev': 83, 'epsilon': 192, 'zeta': 264, 'alpha': -58, 'beta': 172, 'gamma': 51,  'delta': 86},   # S-motif
+    '4s': {'delta_prev': 145, 'epsilon': 264, 'zeta': -70, 'alpha': -68, 'beta': 173, 'gamma': 175, 'delta': 83},
+    '#a': {'delta_prev': 145, 'epsilon': 210, 'zeta': 296, 'alpha': -66, 'beta': 177, 'gamma': 54,  'delta': 83},
+    '7r': {'delta_prev': 83, 'epsilon': 304, 'zeta': 67,  'alpha': -65, 'beta': 175, 'gamma': 55,  'delta': 83},
+    '6n': {'delta_prev': 83, 'epsilon': 268, 'zeta': 288, 'alpha': -66, 'beta': 173, 'gamma': 60,  'delta': 145},
+    '0a': {'delta_prev': 83, 'epsilon': 223, 'zeta': 180, 'alpha': 51,  'beta': 173, 'gamma': 51,  'delta': 83},
+    '&a': {'delta_prev': 83, 'epsilon': 210, 'zeta': 300, 'alpha': -67, 'beta': 160, 'gamma': 54,  'delta': 83},
+}
+
+SUITE_ANGLE_KEYS = ['delta_prev', 'epsilon', 'zeta', 'alpha', 'beta', 'gamma', 'delta']
+SUITE_TOLERANCE_DEG = 40.0   # degrees; Mahalanobis distance threshold for penalty onset
 
 
 class RiemannianRefiner:
@@ -278,3 +299,88 @@ class RiemannianRefiner:
             coords[i] = c + M @ d
 
         return coords
+
+    def suite_conformer_penalty(
+        self, angles_deg: dict[str, float], config: RNABiologyConstants | None = None
+    ) -> float:
+        """Penalise backbone angles that fall outside all known suite conformer clusters.
+
+        Computes L1 distance from each suite cluster mean and returns the
+        excess beyond SUITE_TOLERANCE_DEG for the nearest cluster.
+        Returns 0.0 if the angles are within any known suite cluster.
+
+        Source: Richardson JS et al. (2008) RNA 14:465-481.
+
+        Args:
+            angles_deg: Dict with keys matching SUITE_ANGLE_KEYS, values in degrees.
+            config: Optional RNABiologyConstants; uses default if None.
+
+        Returns:
+            Non-negative penalty value (kcal/mol units, scaled by weight_suite_penalty).
+        """
+        cfg = config or RNABiologyConstants()
+        best_dist = float('inf')
+        for suite_name, means in SUITE_CLUSTER_MEANS.items():
+            dist = 0.0
+            for key in SUITE_ANGLE_KEYS:
+                if key in angles_deg and key in means:
+                    diff = abs(angles_deg[key] - means[key])
+                    diff = min(diff, 360.0 - diff)   # handle periodicity
+                    dist += diff
+            if dist < best_dist:
+                best_dist = dist
+        excess = max(0.0, best_dist - SUITE_TOLERANCE_DEG)
+        return excess * cfg.weight_suite_penalty
+
+    def sugar_pucker_penalty(
+        self, delta_deg: float, position_type: str = 'helix',
+        config: RNABiologyConstants | None = None,
+    ) -> float:
+        """Penalise δ torsion angles outside valid C3'-endo / C2'-endo windows.
+
+        Source: Altona C, Sundaralingam M (1972) JACS 94:8205-8212.
+
+        Args:
+            delta_deg: δ torsion angle in degrees.
+            position_type: 'helix' (default, C3'-endo expected) or
+                           'non_canonical' (C2'-endo allowed).
+            config: Optional RNABiologyConstants; uses default if None.
+
+        Returns:
+            Non-negative penalty in kcal/mol.
+        """
+        cfg = config or RNABiologyConstants()
+        in_c3endo = cfg.c3endo_delta_min <= delta_deg <= cfg.c3endo_delta_max
+        in_c2endo = cfg.c2endo_delta_min <= delta_deg <= cfg.c2endo_delta_max
+
+        if in_c3endo:
+            return 0.0
+        if in_c2endo:
+            # C2'-endo is OK at non-canonical positions, small penalty in helix
+            return 0.0 if position_type == 'non_canonical' else 0.5
+        # Outside both windows — strong penalty
+        nearest_boundary = min(
+            abs(delta_deg - cfg.c3endo_delta_min),
+            abs(delta_deg - cfg.c3endo_delta_max),
+            abs(delta_deg - cfg.c2endo_delta_min),
+            abs(delta_deg - cfg.c2endo_delta_max),
+        )
+        return 0.1 * nearest_boundary ** 2
+
+    def chi_syn_penalty(self, chi_deg: float) -> float:
+        """Penalise syn chi conformation (|chi| < 90 degrees).
+
+        Syn chi is rare in RNA and marks structural distortions.
+        Exceptions: first position of kink-turns, Z-form guanines.
+        Apply penalty universally; caller may zero it out at known syn sites.
+
+        Args:
+            chi_deg: χ torsion angle in degrees.
+
+        Returns:
+            Non-negative penalty in kcal/mol.
+        """
+        if abs(chi_deg) > 90.0:
+            return 0.0   # anti conformation — normal
+        # Quadratic penalty centred at chi=0 (deepest syn), zero at ±90
+        return 0.02 * (90.0 - abs(chi_deg)) ** 2

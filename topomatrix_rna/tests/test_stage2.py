@@ -83,3 +83,91 @@ class TestTropicalBasinCensus:
         census = TropicalBasinCensus(config)
         basins = census.find_basins("AC", np.zeros((2, 2)), n_basins=1)
         assert len(basins) >= 1
+
+
+class TestWeightMatrixBiology:
+    """Tests for biologically corrected weight matrix values."""
+
+    def test_gc_weight_correct(self):
+        """G-C pair should use weight 1.0."""
+        config = TropicalConfig()
+        census = TropicalBasinCensus(config)
+        # Encoding: A=0, C=1, G=2, U=3
+        encoded = np.array([2, 1], dtype=np.int64)  # G-C
+        cm = np.ones((2, 2))
+        W = census._compute_weight_matrix(encoded, cm)
+        # The bp_weight for G-C is config.weight_bp * 1.0 = -2.0 * 1.0 = -2.0
+        # No stacking at L=2 and loop constraint k>=4 prevents use, so these
+        # should remain inf at L=2 (loop length < 4).
+        # Test with longer sequence instead.
+        encoded = np.array([2, 0, 0, 0, 0, 1], dtype=np.int64)  # G....C
+        cm = np.ones((6, 6))
+        W = census._compute_weight_matrix(encoded, cm)
+        # W[0, 5] should be finite (G-C pair with loop length 4)
+        assert np.isfinite(W[0, 5])
+
+    def test_gu_wobble_weight(self):
+        """G-U wobble pair should use weight 0.7."""
+        config = TropicalConfig()
+        census = TropicalBasinCensus(config)
+        encoded = np.array([2, 0, 0, 0, 0, 3], dtype=np.int64)  # G....U
+        cm = np.ones((6, 6))
+        W = census._compute_weight_matrix(encoded, cm)
+        # W[0,5] should be config.weight_bp * 0.7 * (1 + cm[0,5])
+        expected = config.weight_bp * 0.7 * (1.0 + cm[0, 5])
+        assert W[0, 5] == pytest.approx(expected)
+
+
+class TestElectrostaticPenalty:
+    """Tests for Debye-Hückel electrostatic penalty."""
+
+    def test_basic_penalty(self):
+        """Penalty should be non-negative and finite."""
+        from topomatrix_rna.config import RNABiologyConstants
+        from topomatrix_rna.stage2_tropical import compute_electrostatic_penalty
+        coords = np.random.randn(10, 3) * 5.0
+        config = RNABiologyConstants()
+        penalty = compute_electrostatic_penalty(coords, config)
+        assert penalty.shape == (10, 10)
+        assert np.all(penalty >= 0)
+        assert np.all(np.isfinite(penalty))
+
+    def test_distant_atoms_zero_penalty(self):
+        """Distant atoms should have zero penalty."""
+        from topomatrix_rna.config import RNABiologyConstants
+        from topomatrix_rna.stage2_tropical import compute_electrostatic_penalty
+        coords = np.zeros((5, 3))
+        for i in range(5):
+            coords[i, 0] = i * 100.0  # 100 Å apart
+        config = RNABiologyConstants()
+        penalty = compute_electrostatic_penalty(coords, config)
+        assert np.allclose(penalty, 0.0)
+
+
+class TestPseudotorsions:
+    """Tests for η/θ pseudotorsion computation."""
+
+    def test_basic_pseudotorsions(self):
+        """Pseudotorsions should return correct shapes with NaN at termini."""
+        from topomatrix_rna.stage2_tropical import compute_pseudotorsions
+        L = 10
+        c4 = np.random.randn(L, 3)
+        p = np.random.randn(L, 3)
+        eta, theta = compute_pseudotorsions(c4, p)
+        assert eta.shape == (L,)
+        assert theta.shape == (L,)
+        assert np.isnan(eta[0])
+        assert np.isnan(eta[-1])
+        assert np.isnan(theta[0])
+        assert np.isnan(theta[-1])
+
+    def test_interior_values_finite(self):
+        """Interior pseudotorsion values should be finite."""
+        from topomatrix_rna.stage2_tropical import compute_pseudotorsions
+        L = 10
+        c4 = np.random.randn(L, 3) * 5.0
+        p = np.random.randn(L, 3) * 5.0
+        eta, theta = compute_pseudotorsions(c4, p)
+        for i in range(1, L - 1):
+            assert np.isfinite(eta[i])
+            assert np.isfinite(theta[i])

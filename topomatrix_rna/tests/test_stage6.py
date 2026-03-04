@@ -120,3 +120,31 @@ class TestTDAVerifier:
         p1 = v1._geodesic_perturb(theta)
         p2 = v2._geodesic_perturb(theta)
         np.testing.assert_allclose(p1, p2)
+
+
+class TestPseudoknotGenus:
+    """Tests for pseudoknot genus counting."""
+
+    def test_no_pseudoknots(self):
+        """Nested structure should have genus 0."""
+        from topomatrix_rna.stage6_tda_verify import count_pseudoknot_genus
+        bp_list = [(0, 10), (1, 9), (2, 8)]
+        assert count_pseudoknot_genus(bp_list) == 0
+
+    def test_single_pseudoknot(self):
+        """Single crossing pair should give genus 1."""
+        from topomatrix_rna.stage6_tda_verify import count_pseudoknot_genus
+        bp_list = [(0, 5), (3, 8)]  # 0 < 3 < 5 < 8
+        assert count_pseudoknot_genus(bp_list) == 1
+
+    def test_empty(self):
+        """Empty list should give genus 0."""
+        from topomatrix_rna.stage6_tda_verify import count_pseudoknot_genus
+        assert count_pseudoknot_genus([]) == 0
+
+    def test_multiple_crossings(self):
+        """Multiple independent crossings should sum genus."""
+        from topomatrix_rna.stage6_tda_verify import count_pseudoknot_genus
+        bp_list = [(0, 5), (3, 8), (10, 15), (13, 18)]
+        genus = count_pseudoknot_genus(bp_list)
+        assert genus >= 1
