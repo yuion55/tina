@@ -109,3 +109,29 @@ class TestSE3Assembly:
             [coords1, coords2], [(0, 20), (20, 35)], contact_map
         )
         assert not np.any(np.isnan(result)), "NaN found in assembled coordinates"
+
+
+class TestHelixBoundaryPenalty:
+    """Tests for helix boundary penalty function."""
+
+    def test_inside_helix(self):
+        """Cut inside helix should have high penalty."""
+        from topomatrix_rna.stage7_domain import helix_boundary_penalty
+        assert helix_boundary_penalty(5, [(0, 10)], []) == 10.0
+
+    def test_in_linker(self):
+        """Cut in single-stranded linker should have zero penalty."""
+        from topomatrix_rna.stage7_domain import helix_boundary_penalty
+        assert helix_boundary_penalty(15, [(0, 10)], [(12, 18)]) == 0.0
+
+    def test_elsewhere(self):
+        """Cut outside helix and linker should have moderate penalty."""
+        from topomatrix_rna.stage7_domain import helix_boundary_penalty
+        assert helix_boundary_penalty(25, [(0, 10)], [(12, 18)]) == 1.0
+
+    def test_helix_boundary_edge(self):
+        """Cut at helix start/end should not be penalised as inside."""
+        from topomatrix_rna.stage7_domain import helix_boundary_penalty
+        # start < cut < end triggers penalty; cut == start or end does not
+        assert helix_boundary_penalty(0, [(0, 10)], []) == 1.0  # cut == start
+        assert helix_boundary_penalty(10, [(0, 10)], []) == 1.0  # cut == end

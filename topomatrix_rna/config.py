@@ -96,6 +96,65 @@ class DomainConfig:
 
 
 @dataclass
+class RNABiologyConstants:
+    """RNA-specific biological and chemical constants.
+
+    Sources:
+        - Base pair geometry: Saenger W (1984) Principles of Nucleic Acid Structure, Springer.
+        - Stacking distances: Olson WK et al. (2001) J Mol Biol 313:229-237.
+        - Mg2+ coordination: Draper DE (2004) RNA 10:335-343.
+        - Sugar pucker: Altona C, Sundaralingam M (1972) JACS 94:8205-8212.
+        - Backbone torsion means: Richardson JS et al. (2008) RNA 14:465-481.
+        - Contact map weights: Turner DH, Mathews DH (2010) NAR 38:D209-D215.
+    """
+
+    # Base pair geometry (A-form RNA helix)
+    bp_dist_wc_mean: float = 10.4       # Å, C1'-C1' distance in Watson-Crick pair
+    bp_dist_wc_std: float = 0.4         # Å
+    helix_rise_a_form: float = 2.81     # Å per base pair
+    helix_twist_a_form: float = 32.7    # degrees per base pair
+    helix_diameter: float = 18.0        # Å
+
+    # Stacking distances
+    stack_dist_c3c3: float = 3.4        # Å, mean C3'-to-C3' within helix
+    stack_dist_coaxial: float = 3.5     # Å, coaxial stack interface
+    stack_dist_max: float = 5.0         # Å, maximum for stacking bonus
+
+    # Mg2+ coordination
+    mg_inner_sphere_dist: float = 2.07  # Å, mean Mg2+-O direct coordination
+    mg_outer_sphere_dist: float = 4.15  # Å, Mg2+...O via water
+    debye_length_mg_2mm: float = 7.0    # Å, Debye screening at 2 mM Mg2+
+    debye_length_na_100mm: float = 10.0 # Å, Debye screening at 100 mM NaCl
+
+    # Sugar pucker thresholds (delta torsion angle)
+    c3endo_delta_min: float = 55.0      # degrees
+    c3endo_delta_max: float = 110.0     # degrees
+    c2endo_delta_min: float = 120.0     # degrees
+    c2endo_delta_max: float = 175.0     # degrees
+
+    # A-form backbone torsion means (degrees) — Richardson et al. 2008
+    alpha_a_form: float = -68.0
+    beta_a_form: float = 178.0
+    gamma_a_form: float = 54.0
+    delta_a_form: float = 83.0
+    epsilon_a_form: float = 212.0
+    zeta_a_form: float = 289.0
+    chi_a_form: float = -159.0          # anti conformation
+
+    # Contact map weights — biologically calibrated
+    weight_gc_wc: float = 1.0
+    weight_au_wc: float = 0.9
+    weight_gu_wobble: float = 0.7
+    weight_non_canonical: float = 0.4
+    weight_a_minor_bonus: float = 0.3
+    weight_gnra_bonus: float = 0.5
+    weight_coaxial_bonus: float = 0.6
+    weight_mg_bridge: float = 0.4
+    weight_pseudoknot: float = 0.85
+    weight_suite_penalty: float = 0.1   # per degree Mahalanobis outlier
+
+
+@dataclass
 class PipelineConfig:
     """Master configuration for the entire TOPOMATRIX-RNA pipeline."""
 
@@ -106,6 +165,7 @@ class PipelineConfig:
     riemannian: RiemannianConfig = field(default_factory=RiemannianConfig)
     tda: TDAConfig = field(default_factory=TDAConfig)
     domain: DomainConfig = field(default_factory=DomainConfig)
+    biology: RNABiologyConstants = field(default_factory=RNABiologyConstants)
     n_predictions: int = 5
     random_seed: int = 42
     log_level: str = "INFO"

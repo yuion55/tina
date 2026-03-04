@@ -284,3 +284,31 @@ class SE3DomainAssembler:
                     coords[start:end] -= cfg.se3_lr * (total_grad / total_n)
 
         return coords
+
+
+def helix_boundary_penalty(
+    cut_position: int,
+    helix_spans: list[tuple[int, int]],
+    ss_linkers: list[tuple[int, int]],
+) -> float:
+    """Penalty for placing a domain boundary at a given sequence position.
+
+    High penalty (10.0) if cut falls inside a helix (breaks base pairs).
+    Zero penalty if cut falls in a single-stranded linker.
+    Moderate penalty (1.0) otherwise.
+
+    Args:
+        cut_position: Sequence index for proposed domain boundary.
+        helix_spans: Helix (start, end) pairs from secondary structure.
+        ss_linkers: Single-stranded linker (start, end) pairs.
+
+    Returns:
+        Non-negative penalty scalar.
+    """
+    for (start, end) in helix_spans:
+        if start < cut_position < end:
+            return 10.0   # never cut through a helix
+    for (start, end) in ss_linkers:
+        if start <= cut_position <= end:
+            return 0.0    # ideal cut site
+    return 1.0            # acceptable but not preferred
