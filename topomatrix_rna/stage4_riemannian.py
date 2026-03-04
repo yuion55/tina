@@ -119,6 +119,11 @@ class RiemannianRefiner:
             block_start = (step * cfg.block_size) % L
             block_end = min(block_start + cfg.block_size, L)
 
+            # Apply biology penalties to block gradient before ADAM consumes it
+            grad[block_start:block_end] = self._apply_bio_penalty_to_grad(
+                grad[block_start:block_end], theta[block_start:block_end]
+            )
+
             for i in range(block_start, block_end):
                 # Parallel transport momentum (identity on flat torus)
                 m_transported = m[i].copy()
@@ -137,21 +142,6 @@ class RiemannianRefiner:
                 # Riemannian update via exponential map
                 update = -cfg.learning_rate / (np.sqrt(v_hat) + cfg.epsilon) * m_hat
                 theta[i] = exp_map_torus(theta[i], update)
-
-                # Backbone biology penalties — scaled by 0.01 to keep penalty
-                # contribution small relative to the energy gradient magnitude
-                bio = self._bio_config
-                delta_deg = np.degrees(theta[i, 3]) if theta.shape[1] > 3 else 0.0
-                chi_deg = np.degrees(theta[i, 6]) if theta.shape[1] > 6 else 0.0
-                pp = self.sugar_pucker_penalty(delta_deg, config=bio)
-                cp = self.chi_syn_penalty(chi_deg)
-                angle_dict = {
-                    k: np.degrees(theta[i, n])
-                    for n, k in enumerate(SUITE_ANGLE_KEYS) if n < theta.shape[1]
-                }
-                sp = self.suite_conformer_penalty(angle_dict, config=bio)
-                total_bio_pen = pp + cp + sp
-                grad[i] *= (1.0 + total_bio_pen * 0.01)
 
             # Track best
             current_energy = energy_fn(theta)
@@ -210,9 +200,11 @@ class RiemannianRefiner:
 
         for step in range(cfg.n_steps):
             grad_old = self._compute_gradient(theta, seq_encoded, _custom_energy_fn)
+            grad_old = self._apply_bio_penalty_to_grad(grad_old, theta)
             p -= 0.5 * cfg.symplectic_h * grad_old
             theta = (theta + cfg.symplectic_h * p) % (2.0 * np.pi)
             grad_new = self._compute_gradient(theta, seq_encoded, _custom_energy_fn)
+            grad_new = self._apply_bio_penalty_to_grad(grad_new, theta)
             p -= 0.5 * cfg.symplectic_h * grad_new
 
             current_energy = energy_fn(theta)
@@ -221,6 +213,34 @@ class RiemannianRefiner:
                 best_theta = theta.copy()
 
         return best_theta, best_energy
+
+    def _apply_bio_penalty_to_grad(
+        self, grad: np.ndarray, theta: np.ndarray
+    ) -> np.ndarray:
+        """Scale gradient by backbone biology penalties for each residue.
+
+        Args:
+            grad: Gradient array, shape (L, n_torsions).
+            theta: Current torsion angles, shape (L, n_torsions).
+
+        Returns:
+            Penalty-scaled gradient, shape (L, n_torsions).
+        """
+        bio = self._bio_config
+        grad = grad.copy()
+        for i in range(grad.shape[0]):
+            delta_deg = np.degrees(theta[i, 3]) if theta.shape[1] > 3 else 0.0
+            chi_deg = np.degrees(theta[i, 6]) if theta.shape[1] > 6 else 0.0
+            pp = self.sugar_pucker_penalty(delta_deg, config=bio)
+            cp = self.chi_syn_penalty(chi_deg)
+            angle_dict = {
+                k: np.degrees(theta[i, n])
+                for n, k in enumerate(SUITE_ANGLE_KEYS) if n < theta.shape[1]
+            }
+            sp = self.suite_conformer_penalty(angle_dict, config=bio)
+            total_bio_pen = pp + cp + sp
+            grad[i] *= (1.0 + total_bio_pen * 0.01)
+        return grad
 
     def _compute_gradient(
         self,

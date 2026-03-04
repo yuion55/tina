@@ -157,6 +157,38 @@ def detect_coaxial_junctions(
     return coaxial_pairs
 
 
+def _extract_helices(bp_list: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Extract helix spans from a list of base pairs.
+
+    A helix is a run of consecutive base pairs (i, j), (i+1, j-1), ...
+
+    Args:
+        bp_list: List of (i, j) base pairs with i < j.
+
+    Returns:
+        List of (start, end) helix spans.
+    """
+    if not bp_list:
+        return []
+    bp_set = set(bp_list)
+    sorted_bps = sorted(bp_list)
+    visited: set[tuple[int, int]] = set()
+    helices = []
+    for (i, j) in sorted_bps:
+        if (i, j) in visited:
+            continue
+        # Extend helix
+        start_i, end_j = i, j
+        cur_i, cur_j = i, j
+        visited.add((cur_i, cur_j))
+        while (cur_i + 1, cur_j - 1) in bp_set and cur_j - 1 > cur_i + 1:
+            cur_i += 1
+            cur_j -= 1
+            visited.add((cur_i, cur_j))
+        helices.append((start_i, cur_i))
+    return helices
+
+
 class ContactMapPredictor:
     """Predicts RNA contact maps using RG matrix field theory.
 
@@ -261,14 +293,20 @@ class ContactMapPredictor:
         # --- Biology integration ---
         bio = self._bio_config
 
-        # (1) Apply LW weight boost to significant contact positions
-        bp_i, bp_j = np.where(
-            (P_full > 0.1) & (np.arange(L)[:, None] < np.arange(L)[None, :])
-        )
-        for ii, jj in zip(bp_i, bp_j):
-            lw_w = get_lw_weight(sequence[ii], sequence[jj])
-            P_full[ii, jj] *= lw_w
-            P_full[jj, ii] *= lw_w
+        # (1) Apply LW weight boost — vectorised via precomputed (4,4) matrix
+        # Encoding: A=0, C=1, G=2, U=3
+        _LW_MATRIX = np.array([
+            [0.4,  0.35, 0.4, 0.9],   # A vs A,C,G,U
+            [0.35, 0.4,  1.0, 0.4],   # C vs A,C,G,U
+            [0.4,  1.0,  0.4, 0.7],   # G vs A,C,G,U
+            [0.9,  0.4,  0.7, 0.4],   # U vs A,C,G,U
+        ])
+        lw_full = _LW_MATRIX[encoded[:, None], encoded[None, :]]  # (L, L)
+        upper_triangle_mask = np.arange(L)[:, None] < np.arange(L)[None, :]
+        sig_mask = (P_full > 0.1) & upper_triangle_mask
+        P_full[sig_mask] *= lw_full[sig_mask]
+        # Mirror to lower triangle
+        P_full.T[sig_mask] *= lw_full[sig_mask]
 
         # (2) GNRA / tetraloop bonus
         tetraloop_pos = detect_tetraloops(sequence)
@@ -278,11 +316,38 @@ class ContactMapPredictor:
                 P_full[pos:min(pos + 4, L), window] *= (1.0 + bio.weight_gnra_bonus)
 
         # (3) Crossing pairs → pseudoknot weight
+        bp_i, bp_j = np.where(sig_mask)
         bp_list = [(int(i), int(j)) for i, j in zip(bp_i, bp_j)]
         crossing = find_crossing_pairs(bp_list)
         for (ci, cj) in crossing:
             P_full[ci, cj] *= bio.weight_pseudoknot
             P_full[cj, ci] *= bio.weight_pseudoknot
+
+        # (4) Coaxial stacking bonus
+        helices = _extract_helices(bp_list)
+        coaxial_pairs = detect_coaxial_junctions(helices)
+        for (hi, hj) in coaxial_pairs:
+            si, ei = helices[hi]
+            sj, ej = helices[hj]
+            # Boost contacts between the junction ends of the two helices
+            junction_window_i = slice(max(0, ei - 2), min(L, ei + 2))
+            junction_window_j = slice(max(0, sj - 2), min(L, sj + 2))
+            P_full[junction_window_i, junction_window_j] *= (1.0 + bio.weight_coaxial_bonus)
+            P_full[junction_window_j, junction_window_i] *= (1.0 + bio.weight_coaxial_bonus)
+
+        # (5) A-minor bonus: adenosines contacting helices at long range
+        helix_mask = np.zeros(L, dtype=bool)
+        for (hs, he) in helices:
+            helix_mask[hs:min(he + 1, L)] = True
+        a_mask = (encoded == 0)  # A=0
+        # Build boolean mask: (i is A) & (j is in helix) & |i-j|>4 & P>0.1
+        sep = np.abs(np.arange(L)[:, None] - np.arange(L)[None, :])
+        aminor_mask = (
+            a_mask[:, None] & helix_mask[None, :]
+            & (sep > 4) & (P_full > 0.1)
+        )
+        P_full[aminor_mask] *= (1.0 + bio.weight_a_minor_bonus)
+        P_full.T[aminor_mask] *= (1.0 + bio.weight_a_minor_bonus)
 
         # Re-symmetrize and clip after biology adjustments
         P_full = (P_full + P_full.T) / 2.0

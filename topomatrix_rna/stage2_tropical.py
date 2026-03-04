@@ -36,6 +36,10 @@ class TropicalBasinCensus:
         self._bio_config = bio_config or RNABiologyConstants()
         self._c4prime_coords: Optional[np.ndarray] = None
 
+    def set_backbone_coords(self, c4prime_coords: np.ndarray) -> None:
+        """Set C4' coordinates for Mg2+ electrostatic penalty computation."""
+        self._c4prime_coords = c4prime_coords
+
     def find_basins(
         self, sequence: str, contact_map: np.ndarray, n_basins: int = 0
     ) -> List[np.ndarray]:

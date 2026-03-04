@@ -94,6 +94,13 @@ class TDAVerifier:
                         "genus_mismatch",
                         predicted=pred_genus, expected=expected_genus,
                     )
+                    # Force retry: geodesic perturbation and re-refine
+                    theta = self._geodesic_perturb(theta)
+                    try:
+                        theta = refine_fn(theta)
+                    except Exception as e:
+                        logger.debug("refine_error_genus", error=str(e))
+                    continue
 
             w2 = float(wasserstein2_persistence(
                 pred_birth, pred_death, target_birth, target_death
