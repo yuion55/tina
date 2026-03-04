@@ -48,6 +48,23 @@ class TestSpectralDecomposition:
         total = sum(d[1] - d[0] for d in domains)
         assert total == 200
 
+    def test_block_diagonal_decomposition(self):
+        """Block-diagonal contact map should yield at least 2 domains."""
+        config = DomainConfig(use_threshold_length=50, min_domain_size=10)
+        decomposer = SpectralDomainDecomposer(config)
+
+        L = 100
+        contact_map = np.zeros((L, L))
+        # Two strongly connected blocks with zero inter-block contacts
+        contact_map[:50, :50] = 1.0
+        contact_map[50:, 50:] = 1.0
+        np.fill_diagonal(contact_map, 0)
+
+        domains = decomposer.decompose(contact_map, L)
+        assert len(domains) >= 2
+        total = sum(d[1] - d[0] for d in domains)
+        assert total == L
+
 
 class TestSE3Assembly:
     """Tests for SE(3) domain assembly."""
@@ -75,3 +92,20 @@ class TestSE3Assembly:
             [coords1, coords2], [(0, 30), (30, 50)], contact_map
         )
         assert result.shape == (50, 3)
+
+    def test_assembly_no_nan(self):
+        """Assembled coordinates must not contain any NaN values."""
+        config = DomainConfig(se3_steps=2)
+        assembler = SE3DomainAssembler(config)
+
+        np.random.seed(5)
+        coords1 = np.random.randn(20, 3) * 10
+        coords2 = np.random.randn(15, 3) * 10
+        L = 35
+        contact_map = np.random.rand(L, L) * 0.2
+        contact_map = (contact_map + contact_map.T) / 2
+
+        result = assembler.assemble(
+            [coords1, coords2], [(0, 20), (20, 35)], contact_map
+        )
+        assert not np.any(np.isnan(result)), "NaN found in assembled coordinates"

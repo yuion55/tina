@@ -100,21 +100,30 @@ class TemplateRetriever:
     ) -> List[Tuple[str, AtlasEntry]]:
         """Pre-filter atlas entries by stable rank L2 distance.
 
+        Uses a pre-built matrix cache on the atlas for O(n·d) vectorised
+        comparison instead of a Python loop.
+
         Args:
             query_sr: Query stable rank signature, shape (64,).
-            atlas: TopologicalAtlas.
+            atlas: TopologicalAtlas (``_build_sr_cache`` called if needed).
             top_k: Number of candidates to return.
 
         Returns:
             List of (pdb_id, AtlasEntry) sorted by stable rank distance.
         """
-        distances = []
-        for pdb_id, entry in atlas.entries.items():
-            dist = np.linalg.norm(query_sr - entry.stable_rank)
-            distances.append((pdb_id, dist, entry))
-
-        distances.sort(key=lambda x: x[1])
-        return [(d[0], d[2]) for d in distances[:top_k]]
+        if not hasattr(atlas, "_sr_matrix"):
+            atlas._build_sr_cache()
+        if atlas._sr_matrix.shape[0] == 0:
+            return []
+        diffs = atlas._sr_matrix - query_sr[np.newaxis, :]
+        distances = np.linalg.norm(diffs, axis=1)
+        k_actual = min(top_k, len(distances))
+        top_idx = np.argpartition(distances, k_actual - 1)[:k_actual]
+        top_idx = top_idx[np.argsort(distances[top_idx])]
+        return [
+            (atlas._sr_pdb_ids[i], atlas.entries[atlas._sr_pdb_ids[i]])
+            for i in top_idx
+        ]
 
     def _compute_sgw(
         self,
@@ -125,10 +134,13 @@ class TemplateRetriever:
         r"""Compute Sliced Gromov-Wasserstein distance between persistence diagrams.
 
         Mathematical Basis:
-            :math:`\text{SGW}(\mu, \nu) = \mathbb{E}_{\theta \sim \text{Unif}(S^1)}
-            [W_1(\pi_\theta \# \mu, \pi_\theta \# \nu)]`
+            Compares internal distance matrices (Gram matrices) of the two
+            diagrams via random projections:
 
-        Approximated with K random projections. Complexity: O(K·n·log n).
+            :math:`\text{SGW}(\mu, \nu) = \mathbb{E}_{v}[W_1(C_1 v, C_2 v)]`
+
+            where :math:`C_1, C_2` are the pairwise distance matrices of the
+            two diagrams. Complexity: O(K·n²).
 
         Args:
             bd1: First persistence diagram, shape (n1, 2).
@@ -138,10 +150,59 @@ class TemplateRetriever:
         Returns:
             SGW distance (float >= 0).
         """
+        if bd1.shape[0] < 2 or bd2.shape[0] < 2:
+            return self._compute_swd(bd1, bd2, n_projections)
+
+        n1, n2 = bd1.shape[0], bd2.shape[0]
+        C1 = np.sqrt(
+            np.sum((bd1[:, None, :] - bd1[None, :, :]) ** 2, axis=2)
+        )
+        C2 = np.sqrt(
+            np.sum((bd2[:, None, :] - bd2[None, :, :]) ** 2, axis=2)
+        )
+        rng = np.random.RandomState(42)
+        total = 0.0
+        for _ in range(n_projections):
+            v1 = rng.randn(n1)
+            v1 /= np.linalg.norm(v1) + 1e-10
+            v2 = rng.randn(n2)
+            v2 /= np.linalg.norm(v2) + 1e-10
+            proj1 = np.sort(C1 @ v1)
+            proj2 = np.sort(C2 @ v2)
+            n_max = max(len(proj1), len(proj2))
+            p1 = np.zeros(n_max)
+            p2 = np.zeros(n_max)
+            p1[: len(proj1)] = proj1
+            p2[: len(proj2)] = proj2
+            total += float(sliced_wasserstein_1d(p1, p2))
+        return total / n_projections
+
+    def _compute_swd(
+        self,
+        bd1: np.ndarray,
+        bd2: np.ndarray,
+        n_projections: int,
+    ) -> float:
+        r"""Compute Sliced Wasserstein Distance between persistence diagrams.
+
+        Fallback when either diagram has fewer than 2 points (no internal
+        distance matrix can be formed for SGW).
+
+        Mathematical Basis:
+            :math:`\text{SWD}(\mu, \nu) = \mathbb{E}_{\theta \sim \text{Unif}(S^1)}
+            [W_1(\pi_\theta \# \mu, \pi_\theta \# \nu)]`
+
+        Args:
+            bd1: First persistence diagram, shape (n1, 2).
+            bd2: Second persistence diagram, shape (n2, 2).
+            n_projections: Number of random projections (K).
+
+        Returns:
+            SWD distance (float >= 0).
+        """
         if bd1.shape[0] == 0 and bd2.shape[0] == 0:
             return 0.0
         if bd1.shape[0] == 0 or bd2.shape[0] == 0:
-            # Distance to empty diagram = total persistence
             bd = bd1 if bd1.shape[0] > 0 else bd2
             return float(np.sum(bd[:, 1] - bd[:, 0]))
 
@@ -149,19 +210,15 @@ class TemplateRetriever:
         total_w1 = 0.0
 
         for _ in range(n_projections):
-            # Random projection direction on S^1
             theta = rng.uniform(0, 2 * np.pi)
             direction = np.array([np.cos(theta), np.sin(theta)])
 
-            # Project diagrams
             proj1 = bd1 @ direction
             proj2 = bd2 @ direction
 
-            # Sort projections
             proj1_sorted = np.sort(proj1)
             proj2_sorted = np.sort(proj2)
 
-            # Pad shorter to match length
             n1, n2 = len(proj1_sorted), len(proj2_sorted)
             n_max = max(n1, n2)
             p1 = np.zeros(n_max)

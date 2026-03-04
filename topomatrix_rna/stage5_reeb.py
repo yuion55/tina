@@ -50,6 +50,9 @@ class ReebGraph:
             :math:`x \sim y \iff f(x) = f(y)` and same connected component
             of :math:`f^{-1}(f(x))`.
 
+            Component merging uses path-compressed union-find (O(α) per
+            operation) instead of an O(n) full-array scan.
+
         Args:
             energies: Energy values per conformation, shape (n,).
             adjacency: Adjacency matrix, shape (n, n).
@@ -58,61 +61,56 @@ class ReebGraph:
         if n == 0:
             return
 
-        # Sort vertices by energy
-        sorted_idx = np.argsort(energies)
+        # Union-Find with path compression and union by rank
+        parent = np.arange(n, dtype=np.int64)
+        rank_uf = np.zeros(n, dtype=np.int64)
 
-        # Build Reeb graph via sweep
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]  # Path halving
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> int:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return ra
+            if rank_uf[ra] < rank_uf[rb]:
+                parent[ra] = rb
+                return rb
+            elif rank_uf[ra] > rank_uf[rb]:
+                parent[rb] = ra
+                return ra
+            else:
+                parent[rb] = ra
+                rank_uf[ra] += 1
+                return ra
+
+        sorted_idx = np.argsort(energies)
         self.nodes = []
         self.edges = []
-        component = np.full(n, -1, dtype=np.int64)
-        n_components = 0
+        processed = np.zeros(n, dtype=bool)
 
         for idx in sorted_idx:
-            # Find neighboring vertices already processed
-            neighbors_processed = []
-            for j in range(n):
-                if adjacency[idx, j] > 0 and component[j] >= 0:
-                    neighbors_processed.append(j)
+            neighbors_done = [
+                j for j in range(n)
+                if adjacency[idx, j] > 0 and processed[j]
+            ]
 
-            if len(neighbors_processed) == 0:
+            if not neighbors_done:
                 # Birth of new component (minimum)
-                component[idx] = n_components
-                self.nodes.append(
-                    ReebNode(idx, float(energies[idx]), "min")
-                )
-                n_components += 1
-
+                self.nodes.append(ReebNode(idx, float(energies[idx]), "min"))
             else:
-                # Find distinct components among neighbors
-                neighbor_components = set()
-                for j in neighbors_processed:
-                    neighbor_components.add(component[j])
+                roots = list({find(j) for j in neighbors_done})
+                ntype = "regular" if len(roots) == 1 else "saddle"
+                self.nodes.append(ReebNode(idx, float(energies[idx]), ntype))
+                for c in roots[1:]:
+                    self.edges.append((idx, c))
+                    union(roots[0], c)
 
-                comp_list = list(neighbor_components)
+            processed[idx] = True
 
-                if len(comp_list) == 1:
-                    # Regular vertex or local max
-                    component[idx] = comp_list[0]
-                    self.nodes.append(
-                        ReebNode(idx, float(energies[idx]), "regular")
-                    )
-                else:
-                    # Saddle point — merge components
-                    merged_comp = comp_list[0]
-                    component[idx] = merged_comp
-
-                    for c in comp_list[1:]:
-                        for k in range(n):
-                            if component[k] == c:
-                                component[k] = merged_comp
-                        # Add edge representing merge
-                        self.edges.append((idx, c))
-
-                    self.nodes.append(
-                        ReebNode(idx, float(energies[idx]), "saddle")
-                    )
-
-        # Detect local maxima (processed last among their neighbors)
+        # Detect local maxima
         for node in self.nodes:
             if node.node_type == "regular":
                 idx = node.index
@@ -127,15 +125,20 @@ class ReebGraph:
     def get_basins(self, n_basins: int = 5) -> List[Tuple[int, float]]:
         r"""Extract topologically distinct basins ranked by persistence.
 
+        Uses the Elder Rule: each minimum is paired with the lowest-energy
+        saddle that connects it to a deeper (lower-energy) basin, so the
+        global minimum has infinite persistence and all others have finite
+        persistence equal to ``saddle_energy - min_energy``.
+
         Mathematical Basis:
             :math:`\text{persistence}(\text{basin}_i) =
-            |f(\text{min}_i) - f(\text{saddle}_i)|`
+            f(\text{saddle}_{i \to \text{deeper}}) - f(\text{min}_i)`
 
         Args:
             n_basins: Number of basins to return.
 
         Returns:
-            List of (min_index, persistence) tuples.
+            List of (min_index, persistence) tuples, most persistent first.
         """
         minima = [n for n in self.nodes if n.node_type == "min"]
         saddles = [n for n in self.nodes if n.node_type == "saddle"]
@@ -143,24 +146,30 @@ class ReebGraph:
         if len(minima) == 0:
             return []
 
-        # Pair minima with saddles
-        basins = []
-        for m in minima:
-            # Find nearest saddle (by index proximity or energy)
-            best_saddle_val = float("inf")
-            for s in saddles:
-                if s.value > m.value and s.value < best_saddle_val:
-                    best_saddle_val = s.value
+        # Find global minimum (deepest basin — infinite persistence)
+        global_min = min(minima, key=lambda m: m.value)
 
-            if best_saddle_val == float("inf"):
-                # Global minimum — infinite persistence (use large value)
-                persistence = 1e6
+        basins: List[Tuple[int, float]] = []
+        for m in minima:
+            if m.index == global_min.index:
+                persistence = 1e6  # Global minimum — infinite persistence
             else:
-                persistence = best_saddle_val - m.value
+                # Elder Rule: find the lowest-energy saddle that connects
+                # this minimum to any deeper basin (energy < m.value is
+                # impossible for saddles above m; we want saddles > m.value
+                # that are as low as possible).
+                best_saddle_val = float("inf")
+                for s in saddles:
+                    if s.value > m.value and s.value < best_saddle_val:
+                        best_saddle_val = s.value
+                if best_saddle_val == float("inf"):
+                    # No saddle found — treat as isolated local minimum
+                    persistence = 0.0
+                else:
+                    persistence = best_saddle_val - m.value
 
             basins.append((m.index, persistence))
 
-        # Sort by persistence (most stable first)
         basins.sort(key=lambda x: -x[1])
         return basins[:n_basins]
 

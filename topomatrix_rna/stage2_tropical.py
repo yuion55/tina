@@ -15,6 +15,7 @@ from typing import List, Tuple
 
 import numpy as np
 import structlog
+from scipy import sparse
 
 from .config import TropicalConfig
 from .data_utils import encode_sequence
@@ -47,6 +48,10 @@ class TropicalBasinCensus:
             :math:`\text{OPT}(i,j) = \min(w_{ij} + \text{OPT}(i+1,j-1),\;
             \min_{i<k<j}[\text{OPT}(i,k) + \text{OPT}(k+1,j)])`
 
+            Sub-optimal basins are found by systematic perturbation via
+            tropical Gaussian elimination and min-plus matrix products,
+            replacing random noise with algebraically grounded shifts.
+
         Args:
             sequence: RNA sequence string.
             contact_map: Contact probability matrix from Stage 1.
@@ -73,13 +78,30 @@ class TropicalBasinCensus:
         if len(opt_pairs) > 0:
             basins.append(np.array(opt_pairs, dtype=np.int64))
 
-        # Find sub-optimal basins by perturbation
-        rng = np.random.RandomState(42)
+        # Build tropical linear system for systematic sub-optimal generation
+        A, b = self._build_tropical_system(W, L)
+
         for k in range(1, n_basins):
-            # Perturb weights
-            noise = rng.uniform(-0.3, 0.3, size=W.shape)
-            W_perturbed = W + noise
-            pairs = self._tropical_dp(W_perturbed, L)
+            # Modify right-hand side to steer toward a different solution
+            b_k = b.copy()
+            if L > 0:
+                b_k[k % L] += float(k) * 0.5
+
+            # Solve tropical system to get a perturbation vector
+            x_k = tropical_gaussian_elim(A, b_k)
+
+            # Build perturbation diagonal matrix and propagate via min-plus
+            n = min(L, x_k.shape[0])
+            D_k = np.full((n, n), np.inf)
+            for ii in range(n):
+                if x_k[ii] < np.inf:
+                    D_k[ii, ii] = x_k[ii]
+
+            W_mod = tropical_min_plus(W[:n, :n], D_k)
+            # Restore original inf entries where W was inf
+            W_mod[W_mod >= 1e15] = np.inf
+
+            pairs = self._tropical_dp(W_mod, L)
             if len(pairs) > 0:
                 basins.append(np.array(pairs, dtype=np.int64))
 
@@ -89,12 +111,36 @@ class TropicalBasinCensus:
         logger.info("tropical_basins_found", n_basins=len(basins), L=L)
         return basins
 
+    def _build_tropical_system(
+        self, W: np.ndarray, L: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build tropical linear system A, b from the weight matrix.
+
+        The coefficient matrix is W itself; the right-hand side b[i] is the
+        minimum finite weight available for each position (i.e., the cost of
+        the best base-pair partner for residue i).
+
+        Args:
+            W: Tropical weight matrix, shape (L, L).
+            L: Sequence length.
+
+        Returns:
+            Tuple of (A, b) where A has shape (L, L) and b has shape (L,).
+        """
+        A = W.copy()
+        b = np.full(L, np.inf)
+        for i in range(L):
+            row_min = np.min(W[i])
+            b[i] = row_min if row_min < np.inf else 0.0
+        return A, b
+
     def _compute_weight_matrix(
         self, encoded: np.ndarray, contact_map: np.ndarray
     ) -> np.ndarray:
         """Compute tropical weight matrix from sequence and contact probabilities.
 
         Weights combine base-pairing affinity with contact probability.
+        Handles both dense ``np.ndarray`` and sparse ``csr_matrix`` contact maps.
 
         Args:
             encoded: Encoded sequence, shape (L,).
@@ -105,6 +151,12 @@ class TropicalBasinCensus:
         """
         L = encoded.shape[0]
         W = np.full((L, L), np.inf)
+
+        # Convert sparse to dense for indexing within the DP loop
+        if sparse.issparse(contact_map):
+            cm = contact_map.toarray()
+        else:
+            cm = contact_map
 
         for i in range(L):
             for j in range(i + 4, L):  # Minimum loop length = 4
@@ -121,7 +173,7 @@ class TropicalBasinCensus:
 
                 if bp_weight < np.inf:
                     # Combine with contact probability
-                    p_contact = contact_map[i, j] if contact_map.shape[0] > 0 else 0.5
+                    p_contact = cm[i, j] if cm.shape[0] > 0 else 0.5
                     W[i, j] = bp_weight * (1.0 + p_contact)
 
                     # Stacking bonus for consecutive base pairs
@@ -192,30 +244,43 @@ class TropicalBasinCensus:
         self,
         tb: np.ndarray,
         W: np.ndarray,
-        i: int,
-        j: int,
+        i_start: int,
+        j_start: int,
         pairs: List[Tuple[int, int]],
     ) -> None:
-        """Recursive traceback through DP table."""
-        if i >= j - 3:
-            return
+        """Iterative traceback through DP table (avoids stack overflow at L > 800).
 
-        k = tb[i, j]
-        if k == -1:
-            # j is unpaired
-            self._traceback(tb, W, i, j - 1, pairs)
-        elif k >= 0:
-            # k pairs with j
-            pairs.append((k, j))
-            if k > i:
-                self._traceback(tb, W, i, k - 1, pairs)
-            if k + 1 < j - 1:
-                self._traceback(tb, W, k + 1, j - 1, pairs)
-        else:
-            # Bifurcation at -(k+2)
-            split = -(k + 2)
-            self._traceback(tb, W, i, split, pairs)
-            self._traceback(tb, W, split + 1, j, pairs)
+        Replaces the recursive version with an explicit stack to support
+        arbitrarily long sequences without hitting Python's recursion limit.
+
+        Args:
+            tb: Traceback table, shape (L, L).
+            W: Weight matrix, shape (L, L).
+            i_start: Start of the interval.
+            j_start: End of the interval.
+            pairs: Output list of (i, j) base pairs (modified in place).
+        """
+        stack = [(i_start, j_start)]
+        while stack:
+            i, j = stack.pop()
+            if i >= j - 3:
+                continue
+            k = int(tb[i, j])
+            if k == -1:
+                # j is unpaired
+                stack.append((i, j - 1))
+            elif k >= 0:
+                # k pairs with j
+                pairs.append((k, j))
+                if k > i:
+                    stack.append((i, k - 1))
+                if k + 1 < j - 1:
+                    stack.append((k + 1, j - 1))
+            else:
+                # Bifurcation at -(k+2)
+                split = -(k + 2)
+                stack.append((i, split))
+                stack.append((split + 1, j))
 
     def basins_to_coordinates(
         self,
