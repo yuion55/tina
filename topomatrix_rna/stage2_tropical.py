@@ -99,7 +99,7 @@ class TropicalBasinCensus:
 
             W_mod = tropical_min_plus(W[:n, :n], D_k)
             # Restore original inf entries where W was inf
-            W_mod[W_mod >= 1e15] = np.inf
+            # tropical_min_plus propagates np.inf correctly; no fixup needed.
 
             pairs = self._tropical_dp(W_mod, L)
             if len(pairs) > 0:

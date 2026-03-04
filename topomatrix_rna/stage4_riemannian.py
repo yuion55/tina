@@ -255,6 +255,8 @@ class RiemannianRefiner:
         BOND_LENGTH = 5.9      # Å, C3'–C3' virtual bond
         BOND_ANGLE = 1.745     # rad, ~100°
 
+        COMPLEMENT_ANGLE = np.pi - BOND_ANGLE  # ~0.204 rad (complement of ~100°)
+
         for i in range(3, L):
             a, b, c = coords[i - 3], coords[i - 2], coords[i - 1]
             torsion = theta[i, 0]  # Backbone torsion (alpha)
@@ -268,9 +270,9 @@ class RiemannianRefiner:
             n_vec = n_vec / n_norm if n_norm > 1e-10 else np.array([0.0, 0.0, 1.0])
 
             d = np.array([
-                -BOND_LENGTH * np.cos(np.pi - BOND_ANGLE),
-                 BOND_LENGTH * np.cos(torsion) * np.sin(np.pi - BOND_ANGLE),
-                 BOND_LENGTH * np.sin(torsion) * np.sin(np.pi - BOND_ANGLE),
+                -BOND_LENGTH * np.cos(COMPLEMENT_ANGLE),
+                 BOND_LENGTH * np.cos(torsion) * np.sin(COMPLEMENT_ANGLE),
+                 BOND_LENGTH * np.sin(torsion) * np.sin(COMPLEMENT_ANGLE),
             ])
             M = np.column_stack([bc, np.cross(n_vec, bc), n_vec])
             coords[i] = c + M @ d

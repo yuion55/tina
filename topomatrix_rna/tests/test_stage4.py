@@ -151,4 +151,6 @@ class TestRiemannianRefiner:
 
         for i in range(1, L):
             d = np.linalg.norm(coords[i] - coords[i - 1])
-            assert 3.0 <= d <= 10.0, f"Bond distance at {i} = {d:.2f} out of range"
+            assert 3.0 <= d <= 10.0, (
+                f"Bond distance between residues {i-1} and {i} = {d:.2f} out of range"
+            )
