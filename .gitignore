@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.npz
+predictions/
+atlas_cache.npz
+.ipynb_checkpoints/
+numba_cache/
