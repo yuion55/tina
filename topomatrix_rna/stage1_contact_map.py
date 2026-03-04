@@ -166,8 +166,9 @@ class ContactMapPredictor:
     3. Reconstruct full contact map via hierarchical composition
     """
 
-    def __init__(self, config: ContactMapConfig) -> None:
+    def __init__(self, config: ContactMapConfig, bio_config: Optional[RNABiologyConstants] = None) -> None:
         self.config = config
+        self._bio_config = bio_config or RNABiologyConstants()
 
     def predict(
         self, sequence: str, return_sparse: bool = True
@@ -254,6 +255,36 @@ class ContactMapPredictor:
                 P_full[sj:ej, si:ei] = block.T
 
         # Ensure symmetric and bounded
+        P_full = (P_full + P_full.T) / 2.0
+        np.clip(P_full, 0.0, 1.0, out=P_full)
+
+        # --- Biology integration ---
+        bio = self._bio_config
+
+        # (1) Apply LW weight boost to significant contact positions
+        bp_i, bp_j = np.where(
+            (P_full > 0.1) & (np.arange(L)[:, None] < np.arange(L)[None, :])
+        )
+        for ii, jj in zip(bp_i, bp_j):
+            lw_w = get_lw_weight(sequence[ii], sequence[jj])
+            P_full[ii, jj] *= lw_w
+            P_full[jj, ii] *= lw_w
+
+        # (2) GNRA / tetraloop bonus
+        tetraloop_pos = detect_tetraloops(sequence)
+        for pos, loop_type in tetraloop_pos.items():
+            if loop_type in ('GNRA', 'UUCG'):
+                window = slice(max(0, pos - 15), min(L, pos + 20))
+                P_full[pos:min(pos + 4, L), window] *= (1.0 + bio.weight_gnra_bonus)
+
+        # (3) Crossing pairs → pseudoknot weight
+        bp_list = [(int(i), int(j)) for i, j in zip(bp_i, bp_j)]
+        crossing = find_crossing_pairs(bp_list)
+        for (ci, cj) in crossing:
+            P_full[ci, cj] *= bio.weight_pseudoknot
+            P_full[cj, ci] *= bio.weight_pseudoknot
+
+        # Re-symmetrize and clip after biology adjustments
         P_full = (P_full + P_full.T) / 2.0
         np.clip(P_full, 0.0, 1.0, out=P_full)
 

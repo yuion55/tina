@@ -59,8 +59,9 @@ class RiemannianRefiner:
     and optional Störmer-Verlet symplectic integration.
     """
 
-    def __init__(self, config: RiemannianConfig) -> None:
+    def __init__(self, config: RiemannianConfig, bio_config: Optional[RNABiologyConstants] = None) -> None:
         self.config = config
+        self._bio_config = bio_config or RNABiologyConstants()
 
     def refine(
         self,
@@ -136,6 +137,20 @@ class RiemannianRefiner:
                 # Riemannian update via exponential map
                 update = -cfg.learning_rate / (np.sqrt(v_hat) + cfg.epsilon) * m_hat
                 theta[i] = exp_map_torus(theta[i], update)
+
+                # Backbone biology penalties
+                bio = self._bio_config
+                delta_deg = np.degrees(theta[i, 3]) if theta.shape[1] > 3 else 0.0
+                chi_deg = np.degrees(theta[i, 6]) if theta.shape[1] > 6 else 0.0
+                pp = self.sugar_pucker_penalty(delta_deg, config=bio)
+                cp = self.chi_syn_penalty(chi_deg)
+                angle_dict = {
+                    k: np.degrees(theta[i, n])
+                    for n, k in enumerate(SUITE_ANGLE_KEYS) if n < theta.shape[1]
+                }
+                sp = self.suite_conformer_penalty(angle_dict, config=bio)
+                total_bio_pen = pp + cp + sp
+                grad[i] *= (1.0 + total_bio_pen * 0.01)
 
             # Track best
             current_energy = energy_fn(theta)
@@ -318,7 +333,7 @@ class RiemannianRefiner:
         Returns:
             Non-negative penalty value (kcal/mol units, scaled by weight_suite_penalty).
         """
-        cfg = config or RNABiologyConstants()
+        cfg = config or self._bio_config
         best_dist = float('inf')
         for suite_name, means in SUITE_CLUSTER_MEANS.items():
             dist = 0.0
@@ -349,7 +364,7 @@ class RiemannianRefiner:
         Returns:
             Non-negative penalty in kcal/mol.
         """
-        cfg = config or RNABiologyConstants()
+        cfg = config or self._bio_config
         in_c3endo = cfg.c3endo_delta_min <= delta_deg <= cfg.c3endo_delta_max
         in_c2endo = cfg.c2endo_delta_min <= delta_deg <= cfg.c2endo_delta_max
 

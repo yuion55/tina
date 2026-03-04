@@ -35,7 +35,9 @@ class SpectralDomainDecomposer:
         self.config = config
 
     def decompose(
-        self, contact_map: np.ndarray, L: int
+        self, contact_map: np.ndarray, L: int,
+        helix_spans: Optional[list[tuple[int, int]]] = None,
+        ss_linkers: Optional[list[tuple[int, int]]] = None,
     ) -> List[Tuple[int, int]]:
         r"""Decompose sequence into domains using spectral clustering.
 
@@ -87,10 +89,26 @@ class SpectralDomainDecomposer:
             return self._uniform_decomposition(L)
 
         # Find domain boundaries at sign changes of Fiedler vector
+        _helix_spans = helix_spans or []
+        _ss_linkers = ss_linkers or []
         boundaries = [0]
         for i in range(1, L):
             if fiedler[i] * fiedler[i - 1] < 0:
-                boundaries.append(i)
+                pen = helix_boundary_penalty(i, _helix_spans, _ss_linkers)
+                if pen < 5.0:
+                    boundaries.append(i)
+                else:
+                    # Find nearest valid cut in ±5 nt window
+                    for offset in range(1, 6):
+                        found = False
+                        for candidate in [i - offset, i + offset]:
+                            if 0 < candidate < L:
+                                if helix_boundary_penalty(candidate, _helix_spans, _ss_linkers) < 5.0:
+                                    boundaries.append(candidate)
+                                    found = True
+                                    break
+                        if found:
+                            break
 
         # Fallback for disconnected graphs (no sign changes):
         # partition by median value of Fiedler vector.

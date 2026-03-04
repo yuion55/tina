@@ -11,7 +11,7 @@ References:
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import structlog
@@ -31,8 +31,10 @@ class TropicalBasinCensus:
     secondary structures as vertices of the Newton polytope.
     """
 
-    def __init__(self, config: TropicalConfig) -> None:
+    def __init__(self, config: TropicalConfig, bio_config: Optional[RNABiologyConstants] = None) -> None:
         self.config = config
+        self._bio_config = bio_config or RNABiologyConstants()
+        self._c4prime_coords: Optional[np.ndarray] = None
 
     def find_basins(
         self, sequence: str, contact_map: np.ndarray, n_basins: int = 0
@@ -196,6 +198,11 @@ class TropicalBasinCensus:
             # Only apply stacking bonus to cells that are themselves valid
             stack_apply = valid & has_stack
             W[stack_apply] += self.config.weight_stack
+
+        # Apply electrostatic penalty if C4' coordinates are available
+        if self._c4prime_coords is not None:
+            ep = compute_electrostatic_penalty(self._c4prime_coords, self._bio_config)
+            W[valid] += ep[valid]
 
         return W
 
@@ -403,23 +410,44 @@ def compute_pseudotorsions(
     Returns:
         Tuple of (eta, theta) each shape (L,) in degrees. NaN at termini.
     """
-    def torsion(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> float:
-        b1 = b - a
-        b2 = c - b
-        b3 = d - c
-        n1 = np.cross(b1, b2)
-        n2 = np.cross(b2, b3)
-        m1 = np.cross(n1, b2 / (np.linalg.norm(b2) + 1e-12))
-        x = np.dot(n1, n2)
-        y = np.dot(m1, n2)
-        return np.degrees(np.arctan2(y, x))
-
     L = c4prime_coords.shape[0]
     eta = np.full(L, np.nan)
     theta = np.full(L, np.nan)
-    for i in range(1, L - 1):
-        eta[i] = torsion(c4prime_coords[i - 1], p_coords[i],
-                         c4prime_coords[i], p_coords[i + 1])
-        theta[i] = torsion(p_coords[i], c4prime_coords[i],
-                           p_coords[i + 1], c4prime_coords[i + 1])
+
+    if L < 3:
+        return eta, theta
+
+    # Vectorised torsion computation for all interior residues
+    # η(i): torsion(C4'(i-1), P(i), C4'(i), P(i+1)) for i in [1, L-2]
+    b1_eta = p_coords[1:L-1] - c4prime_coords[0:L-2]         # (L-2, 3)
+    b2_eta = c4prime_coords[1:L-1] - p_coords[1:L-1]          # (L-2, 3)
+    b3_eta = p_coords[2:L] - c4prime_coords[1:L-1]            # (L-2, 3)
+    eta[1:L-1] = _vectorised_torsion(b1_eta, b2_eta, b3_eta)
+
+    # θ(i): torsion(P(i), C4'(i), P(i+1), C4'(i+1)) for i in [1, L-2]
+    b1_theta = c4prime_coords[1:L-1] - p_coords[1:L-1]        # (L-2, 3)
+    b2_theta = p_coords[2:L] - c4prime_coords[1:L-1]           # (L-2, 3)
+    b3_theta = c4prime_coords[2:L] - p_coords[2:L]             # (L-2, 3)
+    theta[1:L-1] = _vectorised_torsion(b1_theta, b2_theta, b3_theta)
+
     return eta, theta
+
+
+def _vectorised_torsion(
+    b1: np.ndarray, b2: np.ndarray, b3: np.ndarray
+) -> np.ndarray:
+    """Vectorised torsion angle computation for N bond triplets.
+
+    Args:
+        b1, b2, b3: Bond vectors, each shape (N, 3).
+
+    Returns:
+        Torsion angles in degrees, shape (N,).
+    """
+    n1 = np.cross(b1, b2)                                      # (N, 3)
+    n2 = np.cross(b2, b3)                                      # (N, 3)
+    b2_norm = np.linalg.norm(b2, axis=1, keepdims=True) + 1e-12
+    m1 = np.cross(n1, b2 / b2_norm)                            # (N, 3)
+    x = np.einsum('ij,ij->i', n1, n2)                          # (N,)
+    y = np.einsum('ij,ij->i', m1, n2)                          # (N,)
+    return np.degrees(np.arctan2(y, x))
