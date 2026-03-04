@@ -119,22 +119,12 @@ class RiemannianRefiner:
             block_start = (step * cfg.block_size) % L
             block_end = min(block_start + cfg.block_size, L)
 
-            for i in range(block_start, block_end):
-                # Backbone biology penalties — scale gradient BEFORE ADAM
-                # consumes it, so the penalty actually influences the update
-                bio = self._bio_config
-                delta_deg = np.degrees(theta[i, 3]) if theta.shape[1] > 3 else 0.0
-                chi_deg = np.degrees(theta[i, 6]) if theta.shape[1] > 6 else 0.0
-                pp = self.sugar_pucker_penalty(delta_deg, config=bio)
-                cp = self.chi_syn_penalty(chi_deg)
-                angle_dict = {
-                    k: np.degrees(theta[i, n])
-                    for n, k in enumerate(SUITE_ANGLE_KEYS) if n < theta.shape[1]
-                }
-                sp = self.suite_conformer_penalty(angle_dict, config=bio)
-                total_bio_pen = pp + cp + sp
-                grad[i] *= (1.0 + total_bio_pen * 0.01)
+            # Apply biology penalties to block gradient before ADAM consumes it
+            grad[block_start:block_end] = self._apply_bio_penalty_to_grad(
+                grad[block_start:block_end], theta[block_start:block_end]
+            )
 
+            for i in range(block_start, block_end):
                 # Parallel transport momentum (identity on flat torus)
                 m_transported = m[i].copy()
 

@@ -322,7 +322,7 @@ class TestBUGS4A_PenaltyBeforeAdam:
              patch.object(refiner_noop, 'suite_conformer_penalty', return_value=0.0):
             theta_noop, energy_noop = refiner_noop.refine(theta_init.copy(), seq)
 
-        # With penalties active, the optimisation path should differ
+        # With penalties active, the optimization path should differ
         assert not np.allclose(theta_bio, theta_noop, atol=1e-10), \
             "Bio penalties had no effect on ADAM — still applied after grad consumed?"
 

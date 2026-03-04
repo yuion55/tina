@@ -336,17 +336,18 @@ class ContactMapPredictor:
             P_full[junction_window_j, junction_window_i] *= (1.0 + bio.weight_coaxial_bonus)
 
         # (5) A-minor bonus: adenosines contacting helices at long range
-        helix_positions = set()
+        helix_mask = np.zeros(L, dtype=bool)
         for (hs, he) in helices:
-            for pos in range(hs, he + 1):
-                if pos < L:
-                    helix_positions.add(pos)
-        for idx in range(L):
-            if sequence[idx] == 'A':
-                for hp in helix_positions:
-                    if abs(idx - hp) > 4 and P_full[idx, hp] > 0.1:
-                        P_full[idx, hp] *= (1.0 + bio.weight_a_minor_bonus)
-                        P_full[hp, idx] *= (1.0 + bio.weight_a_minor_bonus)
+            helix_mask[hs:min(he + 1, L)] = True
+        a_mask = (encoded == 0)  # A=0
+        # Build boolean mask: (i is A) & (j is in helix) & |i-j|>4 & P>0.1
+        sep = np.abs(np.arange(L)[:, None] - np.arange(L)[None, :])
+        aminor_mask = (
+            a_mask[:, None] & helix_mask[None, :]
+            & (sep > 4) & (P_full > 0.1)
+        )
+        P_full[aminor_mask] *= (1.0 + bio.weight_a_minor_bonus)
+        P_full.T[aminor_mask] *= (1.0 + bio.weight_a_minor_bonus)
 
         # Re-symmetrize and clip after biology adjustments
         P_full = (P_full + P_full.T) / 2.0
