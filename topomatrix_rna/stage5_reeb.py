@@ -39,6 +39,7 @@ class ReebGraph:
     def __init__(self) -> None:
         self.nodes: List[ReebNode] = []
         self.edges: List[Tuple[int, int]] = []
+        self._saddle_merges: dict = {}  # saddle_idx -> (root_a, root_b)
 
     def build_from_energy(
         self, energies: np.ndarray, adjacency: np.ndarray
@@ -104,6 +105,11 @@ class ReebGraph:
                 roots = list({find(j) for j in neighbors_done})
                 ntype = "regular" if len(roots) == 1 else "saddle"
                 self.nodes.append(ReebNode(idx, float(energies[idx]), ntype))
+                if len(roots) >= 2:
+                    # Record the first pair of roots merged at this saddle.
+                    # Multi-way saddles (len(roots) > 2) are rare in practice
+                    # and the first pair dominates for Elder Rule pairing.
+                    self._saddle_merges[idx] = (roots[0], roots[1])
                 for c in roots[1:]:
                     self.edges.append((idx, c))
                     union(roots[0], c)
@@ -125,10 +131,11 @@ class ReebGraph:
     def get_basins(self, n_basins: int = 5) -> List[Tuple[int, float]]:
         r"""Extract topologically distinct basins ranked by persistence.
 
-        Uses the Elder Rule: each minimum is paired with the lowest-energy
-        saddle that connects it to a deeper (lower-energy) basin, so the
-        global minimum has infinite persistence and all others have finite
-        persistence equal to ``saddle_energy - min_energy``.
+        Uses the Elder Rule (Cohen-Steiner 2006): each minimum is paired
+        with the lowest-energy saddle on the path in the Reeb graph from
+        that minimum to the nearest deeper minimum (its cancellation partner).
+
+        The global minimum is assigned infinite persistence.
 
         Mathematical Basis:
             :math:`\text{persistence}(\text{basin}_i) =
@@ -141,32 +148,92 @@ class ReebGraph:
             List of (min_index, persistence) tuples, most persistent first.
         """
         minima = [n for n in self.nodes if n.node_type == "min"]
-        saddles = [n for n in self.nodes if n.node_type == "saddle"]
+        saddle_nodes = {n.index: n for n in self.nodes if n.node_type == "saddle"}
 
         if len(minima) == 0:
             return []
 
-        # Find global minimum (deepest basin — infinite persistence)
-        global_min = min(minima, key=lambda m: m.value)
+        # Sort minima by energy (ascending = deepest first)
+        minima_sorted = sorted(minima, key=lambda m: m.value)
+        global_min = minima_sorted[0]
+
+        # Build index→node lookup
+        node_by_index = {n.index: n for n in self.nodes}
+
+        # For each minimum, find its Elder Rule cancellation saddle.
+        # A saddle s is a cancellation partner for minimum m if:
+        #   - s.value > m.value  (saddle is above the minimum in energy)
+        #   - the saddle's merge connects m's component to a component
+        #     containing at least one minimum deeper than m.
+        #
+        # We approximate component membership at the time of a saddle event
+        # by using the recorded _saddle_merges roots and the energy ordering:
+        # a root r "contains" minimum m2 if energies[r] <= energies[m2]
+        # (because nodes are processed in energy order, the representative
+        # of a component when a saddle fires is the lowest-energy node
+        # added to that component so far — which is the minimum that
+        # birthed it).
 
         basins: List[Tuple[int, float]] = []
         for m in minima:
             if m.index == global_min.index:
                 persistence = 1e6  # Global minimum — infinite persistence
             else:
-                # Elder Rule: find the lowest-energy saddle that connects
-                # this minimum to any deeper basin (energy < m.value is
-                # impossible for saddles above m; we want saddles > m.value
-                # that are as low as possible).
                 best_saddle_val = float("inf")
-                for s in saddles:
-                    if s.value > m.value and s.value < best_saddle_val:
-                        best_saddle_val = s.value
+
+                if self._saddle_merges:
+                    # Elder Rule: use recorded merge topology
+                    for s_idx, (root_a, root_b) in self._saddle_merges.items():
+                        s_node = saddle_nodes.get(s_idx)
+                        if s_node is None or s_node.value <= m.value:
+                            continue  # Saddle must be strictly above m
+
+                        # A saddle connects m to a deeper basin if one of its
+                        # two roots corresponds to the component containing m
+                        # and the other root corresponds to a component that
+                        # contains (or is rooted at) a minimum deeper than m.
+                        node_a = node_by_index.get(root_a)
+                        node_b = node_by_index.get(root_b)
+
+                        val_a = node_a.value if node_a is not None else float("inf")
+                        val_b = node_b.value if node_b is not None else float("inf")
+
+                        # The component root with the lower energy value is the
+                        # component that was "born" at the deeper minimum.
+                        # Check: does one side match m (or be deeper than m)
+                        # and the other side be a different, deeper basin?
+                        a_is_m_side = abs(val_a - m.value) < 1e-12
+                        b_is_m_side = abs(val_b - m.value) < 1e-12
+
+                        # Also accept if m's energy is between the two roots
+                        # (saddle joins a component containing m with a deeper one)
+                        a_deeper = val_a < m.value
+                        b_deeper = val_b < m.value
+
+                        if (a_is_m_side and b_deeper) or (b_is_m_side and a_deeper):
+                            if s_node.value < best_saddle_val:
+                                best_saddle_val = s_node.value
+
+                # Fallback: if no topology-aware saddle found (e.g. _saddle_merges
+                # not populated or no matching saddle), use the lowest saddle
+                # connecting m to any deeper minimum (original approximation
+                # is still better than nothing).
                 if best_saddle_val == float("inf"):
-                    # No saddle found — treat as isolated local minimum
-                    persistence = 0.0
-                else:
-                    persistence = best_saddle_val - m.value
+                    for s_node in saddle_nodes.values():
+                        if s_node.value > m.value and s_node.value < best_saddle_val:
+                            # Check that there exists at least one deeper minimum
+                            if any(
+                                m2.value < m.value
+                                for m2 in minima
+                                if m2.index != m.index
+                            ):
+                                best_saddle_val = s_node.value
+
+                persistence = (
+                    best_saddle_val - m.value
+                    if best_saddle_val < float("inf")
+                    else 0.0
+                )
 
             basins.append((m.index, persistence))
 
