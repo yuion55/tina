@@ -138,7 +138,8 @@ class RiemannianRefiner:
                 update = -cfg.learning_rate / (np.sqrt(v_hat) + cfg.epsilon) * m_hat
                 theta[i] = exp_map_torus(theta[i], update)
 
-                # Backbone biology penalties
+                # Backbone biology penalties — scaled by 0.01 to keep penalty
+                # contribution small relative to the energy gradient magnitude
                 bio = self._bio_config
                 delta_deg = np.degrees(theta[i, 3]) if theta.shape[1] > 3 else 0.0
                 chi_deg = np.degrees(theta[i, 6]) if theta.shape[1] > 6 else 0.0

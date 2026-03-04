@@ -173,7 +173,7 @@ class TestBIO08ConfigPassThrough:
         refiner = RiemannianRefiner(RiemannianConfig(), bio_config=bio)
         # delta=150 is normally in C2'-endo window; with expanded C3'-endo it's C3'-endo
         pen = refiner.sugar_pucker_penalty(150.0)
-        assert pen == 0.0  # should be zero with expanded range
+        assert pen == pytest.approx(0.0)  # should be zero with expanded range
 
 
 class TestBIO05Stage6GenusWiring:
