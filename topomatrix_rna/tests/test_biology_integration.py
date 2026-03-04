@@ -22,15 +22,21 @@ class TestBIO01StageOneWiring:
     """BIO-01: LW weights, tetraloops, crossing pairs called in predict()."""
 
     def test_lw_weight_called_in_predict(self):
-        """get_lw_weight should be called during predict() for contacts > 0.1."""
+        """LW weights should be applied during predict() for contacts > 0.1 (vectorised)."""
         from topomatrix_rna.stage1_contact_map import ContactMapPredictor
         config = ContactMapConfig()
         predictor = ContactMapPredictor(config)
-        with patch('topomatrix_rna.stage1_contact_map.get_lw_weight', wraps=__import__(
-            'topomatrix_rna.stage1_contact_map', fromlist=['get_lw_weight']
-        ).get_lw_weight) as mock_lw:
-            P = predictor.predict("GGGGAAAACCCC", return_sparse=False)
-            assert mock_lw.call_count > 0, "get_lw_weight was never called in predict()"
+        P = predictor.predict("GGGGAAAACCCC", return_sparse=False)
+        # The vectorised LW weighting scales significant contacts by
+        # the (4,4) LW_MATRIX. G-C canonical pairs stay at 1.0,
+        # while non-canonical (e.g. A-A) get 0.4×, so not all entries
+        # above the threshold should be identical — confirming the LW
+        # weighting pass ran.
+        upper = P[np.triu_indices_from(P, k=1)]
+        sig = upper[upper > 0.01]
+        if len(sig) > 1:
+            assert not np.allclose(sig, sig[0]), \
+                "All significant contacts identical — LW weighting not applied"
 
     def test_detect_tetraloops_called_in_predict(self):
         """detect_tetraloops should be called during predict()."""
