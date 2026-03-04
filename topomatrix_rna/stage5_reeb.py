@@ -39,7 +39,7 @@ class ReebGraph:
     def __init__(self) -> None:
         self.nodes: List[ReebNode] = []
         self.edges: List[Tuple[int, int]] = []
-        self._saddle_merges: dict = {}  # saddle_idx -> (root_a, root_b)
+        self._saddle_merges: dict = {}  # saddle_idx -> (min_of_component_a, min_of_component_b)
 
     def build_from_energy(
         self, energies: np.ndarray, adjacency: np.ndarray
@@ -65,6 +65,10 @@ class ReebGraph:
         # Union-Find with path compression and union by rank
         parent = np.arange(n, dtype=np.int64)
         rank_uf = np.zeros(n, dtype=np.int64)
+        # comp_min maps each uf-root → index of the lowest-energy minimum
+        # in that component.  Maintained through every union() call so that
+        # _saddle_merges stores actual minimum indices, not arbitrary roots.
+        comp_min: dict = {}
 
         def find(x: int) -> int:
             while parent[x] != x:
@@ -78,18 +82,26 @@ class ReebGraph:
                 return ra
             if rank_uf[ra] < rank_uf[rb]:
                 parent[ra] = rb
-                return rb
+                new_root = rb
             elif rank_uf[ra] > rank_uf[rb]:
                 parent[rb] = ra
-                return ra
+                new_root = ra
             else:
                 parent[rb] = ra
                 rank_uf[ra] += 1
-                return ra
+                new_root = ra
+            # Propagate minimum representative to new root
+            min_a = comp_min.get(ra, ra)
+            min_b = comp_min.get(rb, rb)
+            comp_min[new_root] = (
+                min_a if energies[min_a] <= energies[min_b] else min_b
+            )
+            return new_root
 
         sorted_idx = np.argsort(energies)
         self.nodes = []
         self.edges = []
+        self._saddle_merges = {}
         processed = np.zeros(n, dtype=bool)
 
         for idx in sorted_idx:
@@ -101,15 +113,18 @@ class ReebGraph:
             if not neighbors_done:
                 # Birth of new component (minimum)
                 self.nodes.append(ReebNode(idx, float(energies[idx]), "min"))
+                comp_min[idx] = idx  # This node IS its own minimum representative
             else:
                 roots = list({find(j) for j in neighbors_done})
                 ntype = "regular" if len(roots) == 1 else "saddle"
                 self.nodes.append(ReebNode(idx, float(energies[idx]), ntype))
                 if len(roots) >= 2:
-                    # Record the first pair of roots merged at this saddle.
-                    # Multi-way saddles (len(roots) > 2) are rare in practice
-                    # and the first pair dominates for Elder Rule pairing.
-                    self._saddle_merges[idx] = (roots[0], roots[1])
+                    # Record minimum representatives (not uf roots) for Elder Rule.
+                    # comp_min[root] is the lowest-energy minimum in that component.
+                    self._saddle_merges[idx] = (
+                        comp_min.get(roots[0], roots[0]),
+                        comp_min.get(roots[1], roots[1]),
+                    )
                 for c in roots[1:]:
                     self.edges.append((idx, c))
                     union(roots[0], c)
@@ -157,22 +172,8 @@ class ReebGraph:
         minima_sorted = sorted(minima, key=lambda m: m.value)
         global_min = minima_sorted[0]
 
-        # Build index→node lookup
-        node_by_index = {n.index: n for n in self.nodes}
-
-        # For each minimum, find its Elder Rule cancellation saddle.
-        # A saddle s is a cancellation partner for minimum m if:
-        #   - s.value > m.value  (saddle is above the minimum in energy)
-        #   - the saddle's merge connects m's component to a component
-        #     containing at least one minimum deeper than m.
-        #
-        # We approximate component membership at the time of a saddle event
-        # by using the recorded _saddle_merges roots and the energy ordering:
-        # a root r "contains" minimum m2 if energies[r] <= energies[m2]
-        # (because nodes are processed in energy order, the representative
-        # of a component when a saddle fires is the lowest-energy node
-        # added to that component so far — which is the minimum that
-        # birthed it).
+        # Energy lookup by node index — used for _saddle_merges comparison
+        energy_by_idx = {n.index: n.value for n in self.nodes}
 
         basins: List[Tuple[int, float]] = []
         for m in minima:
@@ -182,42 +183,32 @@ class ReebGraph:
                 best_saddle_val = float("inf")
 
                 if self._saddle_merges:
-                    # Elder Rule: use recorded merge topology
-                    for s_idx, (root_a, root_b) in self._saddle_merges.items():
+                    # Elder Rule: _saddle_merges stores actual minimum indices,
+                    # so we can use direct index equality to identify which side
+                    # of a saddle belongs to minimum m's component.
+                    for s_idx, (min_a_idx, min_b_idx) in self._saddle_merges.items():
                         s_node = saddle_nodes.get(s_idx)
                         if s_node is None or s_node.value <= m.value:
                             continue  # Saddle must be strictly above m
 
-                        # A saddle connects m to a deeper basin if one of its
-                        # two roots corresponds to the component containing m
-                        # and the other root corresponds to a component that
-                        # contains (or is rooted at) a minimum deeper than m.
-                        node_a = node_by_index.get(root_a)
-                        node_b = node_by_index.get(root_b)
+                        a_is_m   = (min_a_idx == m.index)
+                        b_is_m   = (min_b_idx == m.index)
+                        a_deeper = (
+                            energy_by_idx.get(min_a_idx, float("inf")) < m.value
+                            and not a_is_m
+                        )
+                        b_deeper = (
+                            energy_by_idx.get(min_b_idx, float("inf")) < m.value
+                            and not b_is_m
+                        )
 
-                        val_a = node_a.value if node_a is not None else float("inf")
-                        val_b = node_b.value if node_b is not None else float("inf")
-
-                        # The component root with the lower energy value is the
-                        # component that was "born" at the deeper minimum.
-                        # Check: does one side match m (or be deeper than m)
-                        # and the other side be a different, deeper basin?
-                        a_is_m_side = abs(val_a - m.value) < 1e-12
-                        b_is_m_side = abs(val_b - m.value) < 1e-12
-
-                        # Also accept if m's energy is between the two roots
-                        # (saddle joins a component containing m with a deeper one)
-                        a_deeper = val_a < m.value
-                        b_deeper = val_b < m.value
-
-                        if (a_is_m_side and b_deeper) or (b_is_m_side and a_deeper):
+                        if (a_is_m and b_deeper) or (b_is_m and a_deeper):
                             if s_node.value < best_saddle_val:
                                 best_saddle_val = s_node.value
 
-                # Fallback: if no topology-aware saddle found (e.g. _saddle_merges
-                # not populated or no matching saddle), use the lowest saddle
-                # connecting m to any deeper minimum (original approximation
-                # is still better than nothing).
+                # Fallback: if no topology-aware saddle found (e.g. isolated
+                # minimum with no deeper basin accessible), use the lowest saddle
+                # above m that connects to any deeper minimum.
                 if best_saddle_val == float("inf"):
                     for s_node in saddle_nodes.values():
                         if s_node.value > m.value and s_node.value < best_saddle_val:
