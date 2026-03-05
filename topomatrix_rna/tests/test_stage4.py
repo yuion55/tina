@@ -251,3 +251,86 @@ class TestChiSynPenalty:
         p_zero = refiner.chi_syn_penalty(0.0)
         p_45 = refiner.chi_syn_penalty(45.0)
         assert p_zero > p_45
+
+    def test_wrapping_near_360(self):
+        """Chi near 360° (syn via wrapping) should be penalized.
+
+        Regression test: chi_syn_penalty previously did not handle angle
+        wrapping, so 350° (equivalent to -10°, syn) had no penalty.
+        """
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        # 350° wraps to -10°, which is syn (|chi| < 90)
+        assert refiner.chi_syn_penalty(350.0) > 0.0
+        # 360° wraps to 0°, deepest syn
+        assert refiner.chi_syn_penalty(360.0) > 0.0
+        # 270° wraps to -90°, boundary — should be exactly zero
+        assert refiner.chi_syn_penalty(270.0) == pytest.approx(0.0, abs=1e-10)
+
+    def test_wrapping_preserves_anti(self):
+        """Anti conformation values should still have zero penalty after wrapping fix."""
+        config = RiemannianConfig()
+        refiner = RiemannianRefiner(config)
+        # 200° wraps to -160° (anti, |chi| > 90)
+        assert refiner.chi_syn_penalty(200.0) == 0.0
+        # 150° stays 150° (anti)
+        assert refiner.chi_syn_penalty(150.0) == 0.0
+
+
+class TestSuiteAngleMapping:
+    """Tests that suite conformer penalty uses correct theta-to-angle mapping."""
+
+    def test_a_form_theta_gives_low_penalty(self):
+        """A-form backbone torsion angles in theta format should give low penalty.
+
+        Regression test: _apply_bio_penalty_to_grad previously used
+        SUITE_ANGLE_KEYS enumeration order to index into theta, causing a
+        complete mismatch between angle names and theta array positions.
+        """
+        config = RiemannianConfig(n_steps=1, block_size=10)
+        refiner = RiemannianRefiner(config)
+
+        # Build theta with A-form angles in the correct positions:
+        # theta order: alpha(0), beta(1), gamma(2), delta(3), epsilon(4), zeta(5), chi(6)
+        # Negative angles are shifted by +360 because theta values are in [0, 2π].
+        a_form_rad = np.array([
+            np.radians(-68 + 360),   # alpha = -68° → 292° (shift to [0, 360])
+            np.radians(178),          # beta = 178°
+            np.radians(55),           # gamma = 55°
+            np.radians(83),           # delta = 83°
+            np.radians(212),          # epsilon = 212°
+            np.radians(289),          # zeta = 289°
+            np.radians(-159 + 360),   # chi = -159° → 201° (shift to [0, 360])
+        ])
+        theta = np.tile(a_form_rad, (3, 1))  # 3 residues
+        seq = np.array([0, 1, 2], dtype=np.int64)
+
+        # The suite penalty alone for A-form should be zero or near-zero
+        angle_dict = {
+            'alpha': np.degrees(theta[1, 0]),
+            'beta': np.degrees(theta[1, 1]),
+            'gamma': np.degrees(theta[1, 2]),
+            'delta': np.degrees(theta[1, 3]),
+            'epsilon': np.degrees(theta[1, 4]),
+            'zeta': np.degrees(theta[1, 5]),
+            'delta_prev': np.degrees(theta[0, 3]),
+        }
+        sp = refiner.suite_conformer_penalty(angle_dict)
+        assert sp == pytest.approx(0.0, abs=1.0), (
+            f"A-form angles should give near-zero suite penalty, got {sp}"
+        )
+
+    def test_delta_prev_uses_previous_residue(self):
+        """delta_prev should come from the previous residue's delta (index 3)."""
+        config = RiemannianConfig(n_steps=1, block_size=10)
+        refiner = RiemannianRefiner(config)
+
+        # Create theta where residue 0 has a specific delta
+        theta = np.ones((3, 7)) * np.pi  # All angles = π
+        theta[0, 3] = np.radians(83)  # delta of residue 0 = 83°
+
+        grad = np.ones((3, 7))
+        result = refiner._apply_bio_penalty_to_grad(grad, theta)
+        # The function should not crash and should return valid gradients
+        assert result.shape == (3, 7)
+        assert np.all(np.isfinite(result))

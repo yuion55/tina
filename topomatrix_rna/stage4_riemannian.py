@@ -228,15 +228,25 @@ class RiemannianRefiner:
         """
         bio = self._bio_config
         grad = grad.copy()
+        # Correct mapping from theta array indices to backbone angle names.
+        # theta order: alpha(0), beta(1), gamma(2), delta(3), epsilon(4), zeta(5), chi(6)
+        _THETA_IDX_TO_SUITE = {
+            0: 'alpha', 1: 'beta', 2: 'gamma', 3: 'delta',
+            4: 'epsilon', 5: 'zeta',
+        }
         for i in range(grad.shape[0]):
             delta_deg = np.degrees(theta[i, 3]) if theta.shape[1] > 3 else 0.0
             chi_deg = np.degrees(theta[i, 6]) if theta.shape[1] > 6 else 0.0
             pp = self.sugar_pucker_penalty(delta_deg, config=bio)
             cp = self.chi_syn_penalty(chi_deg)
             angle_dict = {
-                k: np.degrees(theta[i, n])
-                for n, k in enumerate(SUITE_ANGLE_KEYS) if n < theta.shape[1]
+                name: np.degrees(theta[i, idx])
+                for idx, name in _THETA_IDX_TO_SUITE.items()
+                if idx < theta.shape[1]
             }
+            # delta_prev comes from the previous residue's delta angle
+            if i > 0 and theta.shape[1] > 3:
+                angle_dict['delta_prev'] = np.degrees(theta[i - 1, 3])
             sp = self.suite_conformer_penalty(angle_dict, config=bio)
             total_bio_pen = pp + cp + sp
             grad[i] *= (1.0 + total_bio_pen * 0.01)
@@ -416,7 +426,11 @@ class RiemannianRefiner:
         Returns:
             Non-negative penalty in kcal/mol.
         """
-        if abs(chi_deg) > 90.0:
+        # Normalize to [-180, 180] to handle wrapping (e.g. 350° → -10°)
+        chi_norm = chi_deg % 360.0
+        if chi_norm > 180.0:
+            chi_norm -= 360.0
+        if abs(chi_norm) > 90.0:
             return 0.0   # anti conformation — normal
         # Quadratic penalty centred at chi=0 (deepest syn), zero at ±90
-        return 0.02 * (90.0 - abs(chi_deg)) ** 2
+        return 0.02 * (90.0 - abs(chi_norm)) ** 2

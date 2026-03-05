@@ -231,8 +231,8 @@ class TropicalBasinCensus:
         OPT = np.zeros((L, L))
         traceback = np.full((L, L), -1, dtype=np.int64)
 
-        # Fill DP table
-        for span in range(5, L):
+        # Fill DP table (span >= 4 matches the weight matrix's k=4 offset)
+        for span in range(4, L):
             for i in range(L - span):
                 j = i + span
 
