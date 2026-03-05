@@ -88,7 +88,7 @@ class TDAConfig:
 class DomainConfig:
     """Configuration for Stage 7: Spectral Domain Decomposition."""
 
-    use_threshold_length: int = 500
+    use_threshold_length: int = -1
     min_domain_size: int = 30
     max_domain_size: int = 400
     se3_lr: float = 0.001
@@ -155,6 +155,50 @@ class RNABiologyConstants:
 
 
 @dataclass
+class PhysicsNetConfig:
+    """Dynamic model config — dimensions scale with sequence length."""
+    base_single_dim: int = 128
+    base_pair_dim: int = 64
+    base_n_layers: int = 6
+    base_ipa_layers: int = 4
+    base_n_heads: int = 4
+    n_query_points: int = 4
+    n_recycles: int = 3
+    distogram_bins: int = 64
+    distogram_min: float = 2.0
+    distogram_max: float = 22.0
+    vocab_size: int = 5  # A,C,G,U,pad
+    dropout: float = 0.1
+
+
+@dataclass
+class TrainingConfig:
+    """Training hyperparameters for 3-phase training on Colab T4."""
+    phase1_epochs: int = 50
+    phase2_epochs: int = 100
+    phase3_epochs: int = 50
+    lr_peak: float = 3e-4
+    warmup_steps: int = 1000
+    grad_accum_steps: int = 8
+    max_crop_len: int = 500
+    min_crop_len: int = 64
+    coord_noise_std: float = 0.1
+    msa_max_seqs: int = 128
+    self_distill_plddt_thresh: float = 0.7
+
+
+@dataclass
+class MemoryConfig:
+    """Memory management config for Colab T4 (15GB VRAM, 12GB RAM)."""
+    vram_gb: float = 15.0
+    overhead_gb: float = 2.0
+    cif_chunk_size: int = 80
+    length_bucket_multiple: int = 32
+    gc_every_n_batches: int = 1
+    safety_factor: float = 3.0
+
+
+@dataclass
 class PipelineConfig:
     """Master configuration for the entire TOPOMATRIX-RNA pipeline."""
 
@@ -166,6 +210,10 @@ class PipelineConfig:
     tda: TDAConfig = field(default_factory=TDAConfig)
     domain: DomainConfig = field(default_factory=DomainConfig)
     biology: RNABiologyConstants = field(default_factory=RNABiologyConstants)
+    physics_net: PhysicsNetConfig = field(default_factory=PhysicsNetConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    onnx_model_path: str = "topomatrix_rna/models/rna_physicsnet.onnx"
     n_predictions: int = 5
     random_seed: int = 42
     log_level: str = "INFO"
