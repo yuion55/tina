@@ -264,8 +264,8 @@ class TestChiSynPenalty:
         assert refiner.chi_syn_penalty(350.0) > 0.0
         # 360° wraps to 0°, deepest syn
         assert refiner.chi_syn_penalty(360.0) > 0.0
-        # 270° wraps to -90°, boundary — should be zero or very small
-        assert refiner.chi_syn_penalty(270.0) == pytest.approx(0.0)
+        # 270° wraps to -90°, boundary — should be exactly zero
+        assert refiner.chi_syn_penalty(270.0) == pytest.approx(0.0, abs=1e-10)
 
     def test_wrapping_preserves_anti(self):
         """Anti conformation values should still have zero penalty after wrapping fix."""
@@ -292,14 +292,15 @@ class TestSuiteAngleMapping:
 
         # Build theta with A-form angles in the correct positions:
         # theta order: alpha(0), beta(1), gamma(2), delta(3), epsilon(4), zeta(5), chi(6)
+        # Negative angles are shifted by +360 because theta values are in [0, 2π].
         a_form_rad = np.array([
-            np.radians(-68 + 360),   # alpha = -68° → 292°
+            np.radians(-68 + 360),   # alpha = -68° → 292° (shift to [0, 360])
             np.radians(178),          # beta = 178°
             np.radians(55),           # gamma = 55°
             np.radians(83),           # delta = 83°
             np.radians(212),          # epsilon = 212°
             np.radians(289),          # zeta = 289°
-            np.radians(-159 + 360),   # chi = -159° → 201° (anti)
+            np.radians(-159 + 360),   # chi = -159° → 201° (shift to [0, 360])
         ])
         theta = np.tile(a_form_rad, (3, 1))  # 3 residues
         seq = np.array([0, 1, 2], dtype=np.int64)
