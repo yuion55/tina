@@ -6,14 +6,23 @@ Ensures the model never exceeds available VRAM by:
     - Length bucketing to minimise padding waste
     - Random cropping for long sequences
     - ``gc.collect()`` + ``torch.cuda.empty_cache()`` after every batch
+
+Streaming classes (DiskCacheManager, StreamingCIFDataset, StreamingMSALoader) allow
+on-demand download of individual files from Kaggle so that disk usage stays bounded
+(configurable ``max_disk_cache_gb``).  The lazy-loading ``CompetitionDataset`` avoids
+holding all label coordinates in RAM at once.
 """
 
 from __future__ import annotations
 
+import csv
 import gc
 import math
 import os
 import random
+import shutil
+import subprocess
+import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -253,8 +262,13 @@ if _TORCH_AVAILABLE:
     class CompetitionDataset(Dataset):
         """Dataset for competition CSV data (train_sequences.csv + train_labels.csv).
 
-        Stores only sequence strings + coord arrays in memory (not raw CSV).
-        Supports random crop + coordinate noise augmentation.
+        When ``lazy_labels=True`` (default ``False`` for backwards compatibility), label
+        coordinates are **not** loaded into RAM at init time.  Instead, each ``__getitem__``
+        call reads only the required rows from the labels CSV using a chunked scan.  This
+        keeps peak RAM usage proportional to ``labels_chunk_size`` rather than the full
+        labels file.
+
+        When ``lazy_labels=False`` (original behaviour), all labels are loaded at init.
 
         Args:
             sequences_csv: Path to sequences CSV.
@@ -262,6 +276,8 @@ if _TORCH_AVAILABLE:
             max_crop_len: Maximum crop length for long sequences.
             coord_noise_std: Standard deviation of coordinate noise augmentation.
             vocab_size: Vocabulary size for one-hot encoding.
+            lazy_labels: If True, load label rows on demand instead of all at init.
+            labels_chunk_size: Number of rows to read per chunk when scanning lazily.
         """
 
         def __init__(
@@ -271,6 +287,8 @@ if _TORCH_AVAILABLE:
             max_crop_len: int = 500,
             coord_noise_std: float = 0.1,
             vocab_size: int = 5,
+            lazy_labels: bool = False,
+            labels_chunk_size: int = 10000,
         ) -> None:
             super().__init__()
             from .data_utils import load_sequences_csv, load_labels_csv
@@ -279,21 +297,101 @@ if _TORCH_AVAILABLE:
             self.coord_noise_std = coord_noise_std
             self.vocab_size = vocab_size
             self._nuc_map = {"A": 0, "C": 1, "G": 2, "U": 3, "T": 3}
+            self._lazy_labels = lazy_labels
+            self._labels_csv = labels_csv
+            self._labels_chunk_size = labels_chunk_size
 
-            # Load and store only essential data
+            # Always load sequences (small)
             seq_records = load_sequences_csv(sequences_csv)
-            labels_dict = load_labels_csv(labels_csv)
+            self._seq_index: Dict[str, str] = {rec.seq_id: rec.sequence for rec in seq_records}
 
-            self.entries: List[Tuple[str, str, np.ndarray]] = []
-            for rec in seq_records:
-                if rec.seq_id in labels_dict:
-                    self.entries.append((
-                        rec.seq_id,
-                        rec.sequence,
-                        labels_dict[rec.seq_id],
-                    ))
+            if not lazy_labels:
+                # Original behaviour: load all labels into RAM
+                labels_dict = load_labels_csv(labels_csv)
+                self.entries: List[Tuple[str, str, np.ndarray]] = []
+                for rec in seq_records:
+                    if rec.seq_id in labels_dict:
+                        self.entries.append((
+                            rec.seq_id,
+                            rec.sequence,
+                            labels_dict[rec.seq_id],
+                        ))
+                logger.info("competition_dataset_loaded", n_entries=len(self.entries))
+            else:
+                # Lazy mode: only record which seq_ids exist in labels (scan CSV header)
+                self.entries = []
+                self._seq_ids_with_labels: List[str] = []
+                labeled_ids = self._scan_labeled_ids()
+                for rec in seq_records:
+                    if rec.seq_id in labeled_ids:
+                        self._seq_ids_with_labels.append(rec.seq_id)
+                        # entries stores (seq_id, sequence, None) — coords loaded lazily
+                        self.entries.append((rec.seq_id, rec.sequence, None))  # type: ignore[arg-type]
+                logger.info(
+                    "competition_dataset_lazy_init",
+                    n_entries=len(self.entries),
+                )
 
-            logger.info("competition_dataset_loaded", n_entries=len(self.entries))
+        def _scan_labeled_ids(self) -> set:
+            """Quickly scan the labels CSV to find which seq_ids have labels."""
+            labeled: set = set()
+            try:
+                with open(self._labels_csv, newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if header is None:
+                        return labeled
+                    # First column expected to be seq_id or ID-like field
+                    for row in reader:
+                        if row:
+                            labeled.add(row[0])
+            except Exception as e:
+                logger.warning("labels_scan_error", error=str(e))
+            return labeled
+
+        def _load_labels_for_id(self, seq_id: str) -> Optional[np.ndarray]:
+            """Load label coordinates for a single seq_id from the CSV.
+
+            Uses chunked reading to avoid loading the full file into RAM.
+            """
+            try:
+                import pandas as pd
+                for chunk in pd.read_csv(
+                    self._labels_csv,
+                    chunksize=self._labels_chunk_size,
+                ):
+                    # Normalise column names (ensure strings)
+                    chunk.columns = [str(c).strip() for c in chunk.columns]
+                    id_col = chunk.columns[0]
+                    match = chunk[chunk[id_col] == seq_id]
+                    if not match.empty:
+                        coord_cols = [c for c in chunk.columns if c != id_col]
+                        coords = match[coord_cols].values.astype(np.float32)
+                        # Expected shape: (L, 3) — already 2-D
+                        if coords.ndim == 2 and coords.shape[1] == 3:
+                            return coords
+                        # Flat 2-D row or 1-D array: reshape to (L, 3)
+                        flat = coords.ravel()
+                        if flat.size % 3 == 0 and flat.size > 0:
+                            return flat.reshape(-1, 3)
+            except ImportError:
+                # pandas not available — fall back to csv module
+                try:
+                    with open(self._labels_csv, newline="") as f:
+                        reader = csv.reader(f)
+                        header = next(reader, None)
+                        if header is None:
+                            return None
+                        for row in reader:
+                            if row and row[0] == seq_id:
+                                vals = [float(v) for v in row[1:] if v]
+                                if len(vals) % 3 == 0 and vals:
+                                    return np.array(vals, dtype=np.float32).reshape(-1, 3)
+                except Exception as e2:
+                    logger.debug("labels_csv_load_error", seq_id=seq_id, error=str(e2))
+            except Exception as e:
+                logger.debug("labels_chunk_load_error", seq_id=seq_id, error=str(e))
+            return None
 
         def __len__(self) -> int:
             return len(self.entries)
@@ -305,6 +403,14 @@ if _TORCH_AVAILABLE:
                 Dict with keys: seq_onehot, coords, length, seq_id.
             """
             seq_id, sequence, coords = self.entries[idx]
+
+            # In lazy mode, coords may be None — load on demand
+            if coords is None:
+                coords = self._load_labels_for_id(seq_id)
+                if coords is None:
+                    # Return zero coords as fallback
+                    coords = np.zeros((len(sequence), 3), dtype=np.float32)
+
             L = len(sequence)
 
             # Random crop
@@ -380,6 +486,364 @@ if _TORCH_AVAILABLE:
 
         def __len__(self) -> int:
             return math.ceil(len(self.lengths) / self.batch_size)
+
+
+class DiskCacheManager:
+    """Manages a bounded on-disk cache of downloaded dataset files.
+
+    Tracks downloaded files and their sizes.  When the total cache size
+    exceeds ``max_disk_cache_gb`` the oldest files are evicted.
+
+    Supports two download backends:
+    - ``"kaggle"``: uses the Kaggle CLI (``kaggle datasets download``).
+    - ``"local"``: treats ``source_dir`` as a local directory and copies files.
+
+    Args:
+        cache_dir: Local directory used to store cached files.
+        max_disk_cache_gb: Maximum total on-disk cache size in GB.
+        dataset: Kaggle dataset identifier (``owner/name``).
+        data_source: ``"kaggle"`` or ``"local"``.
+        source_dir: Path to local data directory (used when data_source="local").
+    """
+
+    def __init__(
+        self,
+        cache_dir: str = "/tmp/rna_disk_cache",
+        max_disk_cache_gb: float = 8.0,
+        dataset: str = "stanford-rna-3d-folding",
+        data_source: str = "kaggle",
+        source_dir: str = "",
+    ) -> None:
+        self.cache_dir = cache_dir
+        self.max_disk_cache_bytes = int(max_disk_cache_gb * (1024 ** 3))
+        self.dataset = dataset
+        self.data_source = data_source
+        self.source_dir = source_dir
+
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Ordered list of (path, size_bytes, access_time) for eviction
+        self._registry: List[Tuple[str, int, float]] = []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def ensure_file(self, filename: str) -> Optional[str]:
+        """Return the local path to *filename*, downloading it if necessary.
+
+        Args:
+            filename: Relative filename within the dataset (e.g. ``"PDB_RNA/1ABC.cif"``).
+
+        Returns:
+            Absolute local path, or None if the file could not be obtained.
+        """
+        local_path = os.path.join(self.cache_dir, os.path.basename(filename))
+
+        if os.path.isfile(local_path):
+            self._touch(local_path)
+            return local_path
+
+        # Download / copy
+        success = self._fetch(filename, local_path)
+        if not success or not os.path.isfile(local_path):
+            return None
+
+        size = os.path.getsize(local_path)
+        self._registry.append((local_path, size, time.time()))
+        self._evict_if_needed()
+        return local_path
+
+    def release_file(self, local_path: str) -> None:
+        """Delete *local_path* and remove it from the registry.
+
+        Call this after processing a file to keep disk usage low.
+        """
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        self._registry = [(p, s, t) for p, s, t in self._registry if p != local_path]
+
+    def cleanup(self) -> None:
+        """Delete all cached files and clear the registry."""
+        for path, _size, _t in self._registry:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._registry = []
+        # Also remove anything left in cache_dir
+        try:
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _fetch(self, filename: str, dest: str) -> bool:
+        """Download or copy *filename* to *dest*."""
+        if self.data_source == "local":
+            return self._copy_local(filename, dest)
+        return self._download_kaggle(filename, dest)
+
+    def _copy_local(self, filename: str, dest: str) -> bool:
+        """Copy file from a local source directory."""
+        src = os.path.join(self.source_dir, filename)
+        if not os.path.isfile(src):
+            # Try just the basename inside source_dir
+            src = os.path.join(self.source_dir, os.path.basename(filename))
+        if not os.path.isfile(src):
+            logger.debug("local_file_not_found", filename=filename)
+            return False
+        try:
+            shutil.copy2(src, dest)
+            return True
+        except Exception as e:
+            logger.debug("local_copy_error", filename=filename, error=str(e))
+            return False
+
+    def _download_kaggle(self, filename: str, dest: str) -> bool:
+        """Download a single file from the Kaggle dataset using the CLI."""
+        try:
+            result = subprocess.run(
+                [
+                    "kaggle", "datasets", "download",
+                    "-d", self.dataset,
+                    "-f", filename,
+                    "-p", self.cache_dir,
+                    "--unzip",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                logger.debug(
+                    "kaggle_download_failed",
+                    filename=filename,
+                    stderr=result.stderr[:200],
+                )
+                return False
+            # Kaggle puts file at cache_dir/<basename>
+            basename = os.path.basename(filename)
+            downloaded = os.path.join(self.cache_dir, basename)
+            if os.path.isfile(downloaded) and downloaded != dest:
+                shutil.move(downloaded, dest)
+            return os.path.isfile(dest)
+        except Exception as e:
+            logger.debug("kaggle_download_error", filename=filename, error=str(e))
+            return False
+
+    def _touch(self, local_path: str) -> None:
+        """Update the access timestamp for *local_path* in the registry."""
+        now = time.time()
+        self._registry = [
+            (p, s, now if p == local_path else t)
+            for p, s, t in self._registry
+        ]
+
+    def _evict_if_needed(self) -> None:
+        """Evict oldest files until total cache size is within budget."""
+        total = sum(s for _, s, _ in self._registry)
+        if total <= self.max_disk_cache_bytes:
+            return
+
+        # Sort by access time ascending (oldest first)
+        self._registry.sort(key=lambda x: x[2])
+        while self._registry and total > self.max_disk_cache_bytes:
+            path, size, _ = self._registry.pop(0)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            total -= size
+            logger.debug("disk_cache_evicted", path=path, freed_mb=f"{size / 1e6:.1f}")
+
+
+if _TORCH_AVAILABLE:
+
+    class StreamingCIFDataset(IterableDataset):
+        """Memory-safe CIF dataset that downloads files on demand and deletes after use.
+
+        Instead of requiring all CIF files on disk, it accepts a list of
+        filenames and uses a ``DiskCacheManager`` to fetch each chunk from the
+        configured data source (Kaggle or local), then deletes the files once
+        they have been parsed.
+
+        Args:
+            cif_filenames: List of CIF filenames (basenames or relative paths).
+            disk_cache: ``DiskCacheManager`` instance.
+            chunk_size: Number of CIF files to download and process per chunk.
+            parse_fn: Function mapping a file path to an RNAStructure (or None).
+            max_crop_len: Maximum sequence length; longer sequences are cropped.
+            bucket_multiple: Pad lengths to multiples of this value.
+        """
+
+        def __init__(
+            self,
+            cif_filenames: List[str],
+            disk_cache: "DiskCacheManager",
+            chunk_size: int = 20,
+            parse_fn: Optional[Callable] = None,
+            max_crop_len: int = 500,
+            bucket_multiple: int = 32,
+        ) -> None:
+            super().__init__()
+            self.cif_filenames = list(cif_filenames)
+            self.disk_cache = disk_cache
+            self.chunk_size = chunk_size
+            self.max_crop_len = max_crop_len
+            self.bucket_multiple = bucket_multiple
+
+            if parse_fn is None:
+                from .data_utils import parse_cif_c3_coords
+                self.parse_fn = parse_cif_c3_coords
+            else:
+                self.parse_fn = parse_fn
+
+        def __iter__(self) -> Iterator:
+            """Download chunks, parse, yield, then delete downloaded files."""
+            filenames = self.cif_filenames.copy()
+            random.shuffle(filenames)
+
+            for chunk_start in range(0, len(filenames), self.chunk_size):
+                chunk_files = filenames[chunk_start:chunk_start + self.chunk_size]
+                structures = []
+                local_paths: List[str] = []
+
+                for fname in chunk_files:
+                    local_path = self.disk_cache.ensure_file(fname)
+                    if local_path is None:
+                        logger.debug("streaming_cif_skip_no_file", filename=fname)
+                        continue
+                    local_paths.append(local_path)
+                    try:
+                        structure = self.parse_fn(local_path)
+                        if structure is not None:
+                            structures.append(structure)
+                    except Exception as e:
+                        logger.debug("streaming_cif_parse_skip", file=fname, error=str(e))
+
+                # Delete downloaded files immediately after parsing
+                for lp in local_paths:
+                    self.disk_cache.release_file(lp)
+
+                # Length bucketing within chunk
+                structures.sort(key=lambda s: len(s.sequence))
+
+                for structure in structures:
+                    seq = structure.sequence
+                    coords = structure.coords_c3
+                    L = len(seq)
+
+                    if L > self.max_crop_len:
+                        start = random.randint(0, L - self.max_crop_len)
+                        seq = seq[start:start + self.max_crop_len]
+                        coords = coords[start:start + self.max_crop_len]
+                        L = self.max_crop_len
+
+                    pad_len = (self.bucket_multiple - L % self.bucket_multiple) % self.bucket_multiple
+                    if pad_len > 0:
+                        coords = np.pad(coords, ((0, pad_len), (0, 0)), mode="constant")
+                        seq = seq + "A" * pad_len
+
+                    yield {
+                        "sequence": seq,
+                        "coords": coords,
+                        "length": L,
+                        "pdb_id": structure.pdb_id,
+                    }
+
+                del structures
+                gc.collect()
+
+    class StreamingMSALoader:
+        """MSA loader that downloads files on demand and deletes after parsing.
+
+        Wraps ``DiskCacheManager`` so that MSA files are fetched from Kaggle (or
+        a local source) only when needed, then immediately removed to keep disk
+        usage low.
+
+        Args:
+            disk_cache: ``DiskCacheManager`` instance.
+            msa_subdir: Sub-path within the Kaggle dataset for MSA files (e.g. ``"MSA"``).
+            max_seqs: Maximum number of sequences to keep after subsampling.
+            vocab_size: Vocabulary size for one-hot encoding.
+        """
+
+        def __init__(
+            self,
+            disk_cache: "DiskCacheManager",
+            msa_subdir: str = "MSA",
+            max_seqs: int = 128,
+            vocab_size: int = 5,
+        ) -> None:
+            self.disk_cache = disk_cache
+            self.msa_subdir = msa_subdir
+            self.max_seqs = max_seqs
+            self.vocab_size = vocab_size
+            self._nuc_map = {"A": 0, "C": 1, "G": 2, "U": 3, "T": 3, "-": 4}
+
+        def load(self, seq_id: str) -> Optional["torch.Tensor"]:
+            """Download, parse, and delete MSA file for *seq_id*.
+
+            Args:
+                seq_id: Sequence identifier.
+
+            Returns:
+                One-hot MSA tensor ``(N, L, V)`` or None if unavailable.
+            """
+            for ext in [".a3m", ".sto", ".fasta"]:
+                remote_name = os.path.join(self.msa_subdir, seq_id + ext)
+                local_path = self.disk_cache.ensure_file(remote_name)
+                if local_path is not None:
+                    result = self._parse_msa(local_path)
+                    self.disk_cache.release_file(local_path)
+                    return result
+            return None
+
+        def _parse_msa(self, path: str) -> Optional["torch.Tensor"]:
+            """Parse MSA file and return one-hot encoded tensor."""
+            try:
+                sequences: List[str] = []
+                current_seq = ""
+                with open(path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith(">") or line.startswith("#"):
+                            if current_seq:
+                                sequences.append(current_seq)
+                                current_seq = ""
+                        elif line and not line.startswith("//"):
+                            current_seq += line.upper().replace("T", "U")
+                    if current_seq:
+                        sequences.append(current_seq)
+
+                if not sequences:
+                    return None
+
+                if len(sequences) > self.max_seqs:
+                    indices = random.sample(range(len(sequences)), self.max_seqs)
+                    sequences = [sequences[i] for i in sorted(indices)]
+
+                max_len = max(len(s) for s in sequences)
+                onehot = torch.zeros(len(sequences), max_len, self.vocab_size)
+                for i, seq in enumerate(sequences):
+                    for j, c in enumerate(seq):
+                        idx = self._nuc_map.get(c, 4)
+                        onehot[i, j, idx] = 1.0
+
+                return onehot
+
+            except Exception as e:
+                logger.debug("streaming_msa_parse_error", path=path, error=str(e))
+                return None
+            finally:
+                gc.collect()
+
 
 
 def patch_dataloader_memory() -> None:

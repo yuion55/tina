@@ -196,6 +196,15 @@ class MemoryConfig:
     length_bucket_multiple: int = 32
     gc_every_n_batches: int = 1
     safety_factor: float = 3.0
+    # Streaming / on-demand download settings
+    max_disk_cache_gb: float = 8.0
+    streaming_chunk_size: int = 20
+    # Kaggle dataset identifier. When using the Kaggle CLI the format is
+    # ``"owner/dataset-name"`` (e.g. ``"yuion55/stanford-rna-3d-folding"``).
+    kaggle_dataset: str = "stanford-rna-3d-folding"
+    data_source: str = "kaggle"
+    ram_limit_gb: float = 10.0
+    enable_streaming: bool = True
 
 
 @dataclass
