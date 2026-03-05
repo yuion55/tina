@@ -1,8 +1,8 @@
 """Complete training script for Colab T4. Three phases: pretrain → finetune → MSA.
 
-Phase 1: Pre-train on CIF structures from PDB_RNA (ChunkedCIFDataset)
+Phase 1: Pre-train on CIF structures from PDB_RNA (ChunkedCIFDataset or StreamingCIFDataset)
 Phase 2: Fine-tune on competition CSV data (CompetitionDataset)
-Phase 3: Add MSA features (MSAChunkLoader)
+Phase 3: Add MSA features (MSAChunkLoader or StreamingMSALoader)
 
 Uses FP16 via ``torch.cuda.amp.autocast``, gradient accumulation (8 steps),
 and aggressive memory management throughout.
@@ -31,6 +31,34 @@ except ImportError:
     logger.warning("torch_not_available", msg="PyTorch not installed; training unavailable")
 
 
+def _get_ram_used_gb() -> float:
+    """Return current process RAM usage in GB.
+
+    Uses ``psutil`` if available, falls back to ``/proc/meminfo``.
+    """
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 ** 3)
+    except ImportError:
+        pass
+    try:
+        total_kb = 0
+        avail_kb = 0
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total_kb = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+        if total_kb > 0:
+            return (total_kb - avail_kb) / (1024 ** 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+
 if _TORCH_AVAILABLE:
     from .config import PipelineConfig, PhysicsNetConfig, TrainingConfig, MemoryConfig
     from .rna_physicsnet import RNAPhysicsNet, get_dynamic_config
@@ -41,6 +69,9 @@ if _TORCH_AVAILABLE:
         MSAChunkLoader,
         VRAMMonitor,
         BucketBatchSampler,
+        DiskCacheManager,
+        StreamingCIFDataset,
+        StreamingMSALoader,
         patch_dataloader_memory,
     )
     from .scoring import compute_tm_score
@@ -66,6 +97,7 @@ if _TORCH_AVAILABLE:
 
             self.vram_monitor = VRAMMonitor()
             self.best_tm_score = 0.0
+            self._start_epoch: int = 0  # for checkpoint resume
 
             # Build model (default config for medium sequences)
             dyn_cfg = get_dynamic_config(300, self.mem_cfg.vram_gb)
@@ -84,6 +116,49 @@ if _TORCH_AVAILABLE:
                 device=str(self.device),
                 n_params=sum(p.numel() for p in self.model.parameters()),
             )
+
+        # ------------------------------------------------------------------
+        # RAM monitoring
+        # ------------------------------------------------------------------
+
+        def _check_ram(self) -> None:
+            """Emergency cleanup if RAM usage exceeds ``mem_cfg.ram_limit_gb``."""
+            used_gb = _get_ram_used_gb()
+            if used_gb > self.mem_cfg.ram_limit_gb:
+                logger.warning(
+                    "ram_limit_exceeded",
+                    used_gb=f"{used_gb:.2f}",
+                    limit_gb=self.mem_cfg.ram_limit_gb,
+                )
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # ------------------------------------------------------------------
+        # Checkpoint helpers
+        # ------------------------------------------------------------------
+
+        def load_checkpoint(self, path: str) -> None:
+            """Resume training from a saved checkpoint.
+
+            Args:
+                path: Path to a ``.pt`` checkpoint file saved by ``_save_checkpoint``.
+            """
+            if not os.path.isfile(path):
+                logger.warning("checkpoint_not_found", path=path)
+                return
+            checkpoint = torch.load(path, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.best_tm_score = checkpoint.get("best_tm_score", 0.0)
+            self._start_epoch = checkpoint.get("epoch", 0) + 1
+            logger.info(
+                "checkpoint_loaded",
+                path=path,
+                resume_epoch=self._start_epoch,
+                best_tm=f"{self.best_tm_score:.4f}",
+            )
+
 
         def train_epoch(self, dataloader: DataLoader, epoch: int = 0) -> float:
             """Train for one epoch with gradient accumulation.
@@ -134,6 +209,7 @@ if _TORCH_AVAILABLE:
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    self._check_ram()
 
             avg_loss = total_loss / max(n_batches, 1)
             logger.info("epoch_done", epoch=epoch, avg_loss=f"{avg_loss:.4f}")
@@ -171,26 +247,69 @@ if _TORCH_AVAILABLE:
             logger.info("validation_done", mean_tm_score=f"{mean_tm:.4f}", n_seqs=len(tm_scores))
             return mean_tm
 
-        def phase1_pretrain(self, cif_dir: str, n_epochs: Optional[int] = None) -> None:
+        def phase1_pretrain(
+            self,
+            cif_dir: str,
+            n_epochs: Optional[int] = None,
+            cif_filenames: Optional[list] = None,
+            resume_checkpoint: Optional[str] = None,
+        ) -> None:
             """Phase 1: Pre-train on CIF structures.
 
+            When ``mem_cfg.enable_streaming`` is True and ``cif_filenames`` is
+            provided (a list of CIF filenames to stream from the configured data
+            source), a :class:`StreamingCIFDataset` is used instead of the
+            local :class:`ChunkedCIFDataset`.
+
             Args:
-                cif_dir: Directory containing PDB RNA CIF files.
+                cif_dir: Directory containing PDB RNA CIF files (used when
+                    streaming is disabled or ``cif_filenames`` is None).
                 n_epochs: Override number of epochs.
+                cif_filenames: Optional list of CIF filenames for streaming mode.
+                    Each entry should be a relative path within the Kaggle dataset
+                    (e.g. ``"PDB_RNA/1ABC.cif"``).
+                resume_checkpoint: Optional path to a checkpoint to resume from.
             """
             n_epochs = n_epochs or self.train_cfg.phase1_epochs
             logger.info("phase1_start", cif_dir=cif_dir, n_epochs=n_epochs)
 
+            if resume_checkpoint:
+                self.load_checkpoint(resume_checkpoint)
+
             patch_dataloader_memory()
-            dataset = ChunkedCIFDataset(
-                cif_dir, chunk_size=self.mem_cfg.cif_chunk_size,
-                max_crop_len=self.train_cfg.max_crop_len,
-            )
+
+            if self.mem_cfg.enable_streaming and cif_filenames:
+                disk_cache = DiskCacheManager(
+                    max_disk_cache_gb=self.mem_cfg.max_disk_cache_gb,
+                    dataset=self.mem_cfg.kaggle_dataset,
+                    data_source=self.mem_cfg.data_source,
+                    source_dir=cif_dir,
+                )
+                dataset = StreamingCIFDataset(
+                    cif_filenames,
+                    disk_cache,
+                    chunk_size=self.mem_cfg.streaming_chunk_size,
+                    max_crop_len=self.train_cfg.max_crop_len,
+                )
+                logger.info(
+                    "phase1_streaming",
+                    n_files=len(cif_filenames),
+                    chunk_size=self.mem_cfg.streaming_chunk_size,
+                )
+            else:
+                dataset = ChunkedCIFDataset(
+                    cif_dir, chunk_size=self.mem_cfg.cif_chunk_size,
+                    max_crop_len=self.train_cfg.max_crop_len,
+                )
+
             dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
 
-            for epoch in range(n_epochs):
+            start = self._start_epoch
+            for epoch in range(start, n_epochs):
                 self.train_epoch(dataloader, epoch)
                 self.vram_monitor.log_status()
+                if (epoch + 1) % 10 == 0:
+                    self._save_checkpoint(f"phase1_epoch{epoch + 1}.pt", epoch=epoch)
 
             logger.info("phase1_done")
 
@@ -201,6 +320,7 @@ if _TORCH_AVAILABLE:
             val_csv: Optional[str] = None,
             val_labels: Optional[str] = None,
             n_epochs: Optional[int] = None,
+            resume_checkpoint: Optional[str] = None,
         ) -> None:
             """Phase 2: Fine-tune on competition CSV data.
 
@@ -210,14 +330,20 @@ if _TORCH_AVAILABLE:
                 val_csv: Optional validation sequences CSV.
                 val_labels: Optional validation labels CSV.
                 n_epochs: Override number of epochs.
+                resume_checkpoint: Optional path to a checkpoint to resume from.
             """
             n_epochs = n_epochs or self.train_cfg.phase2_epochs
             logger.info("phase2_start", n_epochs=n_epochs)
 
+            if resume_checkpoint:
+                self.load_checkpoint(resume_checkpoint)
+
+            lazy = self.mem_cfg.enable_streaming
             dataset = CompetitionDataset(
                 train_csv, labels_csv,
                 max_crop_len=self.train_cfg.max_crop_len,
                 coord_noise_std=self.train_cfg.coord_noise_std,
+                lazy_labels=lazy,
             )
 
             lengths = [len(e[1]) for e in dataset.entries]
@@ -226,7 +352,8 @@ if _TORCH_AVAILABLE:
             )
             dataloader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
 
-            for epoch in range(n_epochs):
+            start = self._start_epoch
+            for epoch in range(start, n_epochs):
                 self.train_epoch(dataloader, epoch)
 
                 # Validate periodically
@@ -236,7 +363,7 @@ if _TORCH_AVAILABLE:
                     tm = self.validate(val_loader)
                     if tm > self.best_tm_score:
                         self.best_tm_score = tm
-                        self._save_checkpoint("best_model.pt")
+                        self._save_checkpoint("best_model.pt", epoch=epoch)
                     del val_dataset, val_loader
                     gc.collect()
 
@@ -248,28 +375,52 @@ if _TORCH_AVAILABLE:
             labels_csv: str,
             msa_dir: str,
             n_epochs: Optional[int] = None,
+            resume_checkpoint: Optional[str] = None,
         ) -> None:
             """Phase 3: Train with MSA features.
+
+            When ``mem_cfg.enable_streaming`` is True a :class:`StreamingMSALoader`
+            is used to fetch MSA files on demand and delete them after parsing.
 
             Args:
                 train_csv: Path to train_sequences.csv.
                 labels_csv: Path to train_labels.csv.
-                msa_dir: Directory containing MSA files.
+                msa_dir: Directory containing MSA files (used in local mode).
                 n_epochs: Override number of epochs.
+                resume_checkpoint: Optional path to a checkpoint to resume from.
             """
             n_epochs = n_epochs or self.train_cfg.phase3_epochs
             logger.info("phase3_start", msa_dir=msa_dir, n_epochs=n_epochs)
+
+            if resume_checkpoint:
+                self.load_checkpoint(resume_checkpoint)
 
             dataset = CompetitionDataset(
                 train_csv, labels_csv,
                 max_crop_len=self.train_cfg.max_crop_len,
             )
-            msa_loader = MSAChunkLoader(msa_dir, max_seqs=self.train_cfg.msa_max_seqs)
+
+            if self.mem_cfg.enable_streaming:
+                disk_cache = DiskCacheManager(
+                    max_disk_cache_gb=self.mem_cfg.max_disk_cache_gb,
+                    dataset=self.mem_cfg.kaggle_dataset,
+                    data_source=self.mem_cfg.data_source,
+                    source_dir=msa_dir,
+                )
+                msa_loader: "MSAChunkLoader | StreamingMSALoader" = StreamingMSALoader(
+                    disk_cache,
+                    msa_subdir="MSA",
+                    max_seqs=self.train_cfg.msa_max_seqs,
+                )
+                logger.info("phase3_streaming_msa")
+            else:
+                msa_loader = MSAChunkLoader(msa_dir, max_seqs=self.train_cfg.msa_max_seqs)
 
             dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
 
             self.model.train()
-            for epoch in range(n_epochs):
+            start = self._start_epoch
+            for epoch in range(start, n_epochs):
                 total_loss = 0.0
                 n_batches = 0
                 self.optimizer.zero_grad()
@@ -310,9 +461,12 @@ if _TORCH_AVAILABLE:
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    self._check_ram()
 
                 avg_loss = total_loss / max(n_batches, 1)
                 logger.info("phase3_epoch", epoch=epoch, avg_loss=f"{avg_loss:.4f}")
+                if (epoch + 1) % 10 == 0:
+                    self._save_checkpoint(f"phase3_epoch{epoch + 1}.pt", epoch=epoch)
 
             logger.info("phase3_done")
 
@@ -357,11 +511,12 @@ if _TORCH_AVAILABLE:
             logger.info("onnx_exported", path=path)
             return path
 
-        def _save_checkpoint(self, filename: str) -> None:
+        def _save_checkpoint(self, filename: str, epoch: int = 0) -> None:
             """Save model checkpoint.
 
             Args:
                 filename: Checkpoint filename.
+                epoch: Current epoch number (stored for resume support).
             """
             path = os.path.join(self.config.output_dir, filename)
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -369,8 +524,9 @@ if _TORCH_AVAILABLE:
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "best_tm_score": self.best_tm_score,
+                "epoch": epoch,
             }, path)
-            logger.info("checkpoint_saved", path=path)
+            logger.info("checkpoint_saved", path=path, epoch=epoch)
 
 
 def main() -> None:
