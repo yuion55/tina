@@ -171,3 +171,50 @@ class TestPseudotorsions:
         for i in range(1, L - 1):
             assert np.isfinite(eta[i])
             assert np.isfinite(theta[i])
+
+
+class TestTropicalDPMinSpan:
+    """Tests for DP handling of minimum separation base pairs (j-i=4)."""
+
+    def test_dp_finds_pair_at_min_separation(self):
+        """DP should find base pairs at exactly j-i=4 (minimum separation).
+
+        Regression test: DP previously started at span=5 while the weight
+        matrix allowed pairs at j-i >= 4, causing pairs at j-i=4 to be
+        missed entirely.
+        """
+        config = TropicalConfig()
+        census = TropicalBasinCensus(config)
+        # Sequence: G....C  (length 6, G at 0, C at 5)
+        # Pair (0, 5) has j-i=5, always found
+        # Sequence: G...C   (length 5, G at 0, C at 4)
+        # Pair (0, 4) has j-i=4, was previously missed
+        seq_5 = "GAAAC"
+        cm_5 = np.ones((5, 5))
+        basins = census.find_basins(seq_5, cm_5, n_basins=1)
+        # Should find at least one basin with a pair at (0, 4)
+        assert len(basins) >= 1
+        found_pair = False
+        for basin in basins:
+            if basin.shape[0] > 0:
+                for row in range(basin.shape[0]):
+                    if basin[row, 0] == 0 and basin[row, 1] == 4:
+                        found_pair = True
+        assert found_pair, "DP should find pair (0, 4) at minimum separation j-i=4"
+
+    def test_dp_l5_gc_pair(self):
+        """Length-5 G-C sequence should produce a base pair."""
+        config = TropicalConfig()
+        census = TropicalBasinCensus(config)
+        seq = "GUUAC"  # G(0) can pair with C(4), j-i=4
+        cm = np.ones((5, 5))
+        W = census._compute_weight_matrix(
+            np.array([2, 3, 3, 0, 1], dtype=np.int64), cm
+        )
+        # W[0, 4] should be finite (G-C pair)
+        assert np.isfinite(W[0, 4]), "Weight matrix should allow pair at j-i=4"
+        pairs = census._tropical_dp(W, 5)
+        # The DP should find this pair
+        assert any(p == (0, 4) for p in pairs), (
+            "DP should find pair (0, 4) for length-5 G-C sequence"
+        )
