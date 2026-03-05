@@ -333,7 +333,9 @@ if _TORCH_AVAILABLE:
             self.model.eval()
             self.model.cpu()
 
-            dummy_input = torch.zeros(50, 5)  # (L=50, V=5)
+            dummy_len = 50
+            vocab_size = self.config.physics_net.vocab_size
+            dummy_input = torch.zeros(dummy_len, vocab_size)
             dummy_input[:, 0] = 1.0  # All A's
 
             torch.onnx.export(

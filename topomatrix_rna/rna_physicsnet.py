@@ -1,4 +1,4 @@
-"""RNA-PhysicsNet: Physics-informed neural network for RNA 3D structure prediction.
+r"""RNA-PhysicsNet: Physics-informed neural network for RNA 3D structure prediction.
 
 Architecture: Transformer encoder (single+pair track) → IPA structure module → recycling.
 Dynamic scaling: model dims auto-shrink based on sequence length and available VRAM.
@@ -539,7 +539,7 @@ if _TORCH_AVAILABLE:
                 vocab_size, config.single_dim, config.pair_dim,
             )
 
-            self.msa_proj = nn.Linear(vocab_size, config.pair_dim) if True else None
+            self.msa_proj = nn.Linear(vocab_size, config.pair_dim)
 
             self.encoder_blocks = nn.ModuleList([
                 TransformerBlock(
